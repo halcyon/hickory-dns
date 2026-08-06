@@ -1,6 +1,5 @@
 use std::env;
 use std::fs::{self, read_dir};
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +8,7 @@ use toml::map::Keys;
 use toml::value::Array;
 use toml::{Table, Value};
 
-use super::{Config, ServerZoneConfig};
+use super::{Config, ListenerProtocol, NsidConfig, NsidSource, ServerZoneConfig};
 #[cfg(feature = "resolver")]
 use super::{FileConfig, ServerStoreConfig, ZoneTypeConfig};
 use hickory_server::zone_handler::ZoneType;
@@ -26,12 +25,19 @@ fn test_read_config() {
 
     println!("reading config");
     let config = Config::read_config(&path).unwrap();
+    let listeners = config.normalized_listeners().unwrap();
 
-    assert_eq!(config.listen_port, 53);
-    assert_eq!(config.listen_addrs_ipv4, Vec::<Ipv4Addr>::new());
-    assert_eq!(config.listen_addrs_ipv6, Vec::<Ipv6Addr>::new());
+    assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0].socket_addr, "0.0.0.0:2053".parse().unwrap());
+    assert_eq!(
+        listeners[0].protocols,
+        vec![ListenerProtocol::Udp, ListenerProtocol::Tcp]
+    );
     assert_eq!(config.tcp_request_timeout, Duration::from_secs(5));
-    assert_eq!(config.directory, Path::new("/var/named"));
+    assert_eq!(
+        config.zone_directory,
+        Path::new("tests/test-data/test_configs")
+    );
 
     assert_eq!(config.zones[0].zone, "localhost");
     assert_eq!(config.zones[0].zone_type(), ZoneType::Primary);
@@ -81,32 +87,297 @@ fn test_read_config() {
 
 #[test]
 fn test_parse_toml() {
-    let config = Config::from_toml("listen_port = 2053").unwrap();
-    assert_eq!(config.listen_port, 2053);
-
-    let config = Config::from_toml("listen_addrs_ipv4 = [\"0.0.0.0\"]").unwrap();
-    assert_eq!(config.listen_addrs_ipv4, vec![Ipv4Addr::UNSPECIFIED]);
-
-    let config = Config::from_toml("listen_addrs_ipv4 = [\"0.0.0.0\", \"127.0.0.1\"]").unwrap();
-    assert_eq!(
-        config.listen_addrs_ipv4,
-        vec![Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST]
-    );
-
-    let config = Config::from_toml("listen_addrs_ipv6 = [\"::0\"]").unwrap();
-    assert_eq!(config.listen_addrs_ipv6, vec![Ipv6Addr::UNSPECIFIED]);
-
-    let config = Config::from_toml("listen_addrs_ipv6 = [\"::0\", \"::1\"]").unwrap();
-    assert_eq!(
-        config.listen_addrs_ipv6,
-        vec![Ipv6Addr::UNSPECIFIED, Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)]
-    );
-
     let config = Config::from_toml("tcp_request_timeout = 25").unwrap();
     assert_eq!(config.tcp_request_timeout, Duration::from_secs(25));
 
-    let config = Config::from_toml("directory = \"/dev/null\"").unwrap();
-    assert_eq!(config.directory, Path::new("/dev/null"));
+    let config = Config::from_toml("zone_directory = \"/dev/null\"").unwrap();
+    assert_eq!(config.zone_directory, Path::new("/dev/null"));
+}
+
+#[test]
+fn test_parse_nsid_config() {
+    let config = Config::from_toml("nsid = \"hostname\"").unwrap();
+    assert!(matches!(
+        config.nsid,
+        Some(NsidConfig::Value(value)) if value == "hostname"
+    ));
+
+    let config = Config::from_toml("nsid = { source = \"hostname\" }").unwrap();
+    assert!(matches!(
+        config.nsid,
+        Some(NsidConfig::Source(source)) if matches!(source.source, NsidSource::Hostname)
+    ));
+
+    let config = Config::from_toml("").unwrap();
+    assert!(config.nsid.is_none());
+
+    for invalid in [
+        "nsid = { source = \"unknown\" }",
+        "nsid = { source = \"hostname\", extra = true }",
+    ] {
+        assert!(Config::from_toml(invalid).is_err(), "accepted {invalid}");
+    }
+}
+
+#[cfg(feature = "prometheus-metrics")]
+#[test]
+fn test_parse_prometheus_config() {
+    let config = Config::from_toml("").unwrap();
+    assert!(config.prometheus_listen_addr.is_none());
+
+    let config = Config::from_toml("prometheus_listen_addr = \"127.0.0.1:9000\"").unwrap();
+    assert_eq!(
+        config.prometheus_listen_addr,
+        Some("127.0.0.1:9000".parse().unwrap())
+    );
+}
+
+#[test]
+fn test_reject_legacy_config_fields() {
+    for field in [
+        "directory",
+        "listen_addrs_ipv4",
+        "listen_addrs_ipv6",
+        "listen_port",
+        "tls_listen_port",
+        "https_listen_port",
+        "quic_listen_port",
+        "tls_cert",
+        "http_endpoint",
+        "ssl_keylog_enabled",
+        "disable_tcp",
+        "disable_udp",
+        "disable_tls",
+        "disable_https",
+        "disable_quic",
+        "disable_prometheus",
+        "nsid_hostname",
+    ] {
+        let error = Config::from_toml(&format!("{field} = 53")).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected error for {field}: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_and_normalize_listener_blocks() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 2053
+protocols = ["udp", "tcp"]
+
+[[listeners]]
+address = "::1"
+port = 3053
+protocols = ["udp"]
+"#,
+    )
+    .unwrap();
+
+    let listeners = config.normalized_listeners().unwrap();
+    assert_eq!(listeners.len(), 2);
+    assert_eq!(listeners[0].socket_addr, "127.0.0.1:2053".parse().unwrap());
+    assert_eq!(
+        listeners[0].protocols,
+        vec![ListenerProtocol::Udp, ListenerProtocol::Tcp]
+    );
+    assert_eq!(listeners[0].http_endpoint, "/dns-query");
+    assert!(!listeners[0].ssl_keylog_enabled);
+    assert_eq!(listeners[1].socket_addr, "[::1]:3053".parse().unwrap());
+}
+
+#[cfg(feature = "__https")]
+#[test]
+fn test_listener_secure_defaults_and_settings() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "192.0.2.10"
+port = 443
+protocols = ["doh"]
+http_endpoint = "/custom-query"
+ssl_keylog_enabled = true
+
+[listeners.tls_cert]
+path = "example.cert.pem"
+private_key = "example.key.pem"
+endpoint_name = "ns.example.com"
+"#,
+    )
+    .unwrap();
+
+    let listener = config.normalized_listeners().unwrap().pop().unwrap();
+    assert_eq!(listener.http_endpoint, "/custom-query");
+    assert!(listener.ssl_keylog_enabled);
+    assert_eq!(
+        listener.tls_cert.unwrap().endpoint_name.as_deref(),
+        Some("ns.example.com")
+    );
+}
+
+fn invalid_listener(toml: &str, expected: &str) {
+    let error = Config::from_toml(toml)
+        .and_then(|config| config.normalized_listeners().map(|_| config))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(expected),
+        "expected {expected:?} in {error}"
+    );
+}
+
+#[test]
+fn test_reject_invalid_plaintext_listener_blocks() {
+    invalid_listener("", "at least one listener");
+    invalid_listener("listeners = []", "at least one listener");
+    for transport_name in ["tls", "https", "quic"] {
+        invalid_listener(
+            &format!(
+                r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["{transport_name}"]
+"#
+            ),
+            "unknown variant",
+        );
+    }
+    invalid_listener(
+        r#"
+[[listeners]]
+port = 53
+protocols = ["udp"]
+"#,
+        "missing field `address`",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+protocols = ["udp"]
+"#,
+        "missing field `port`",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+"#,
+        "missing field `protocols`",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = []
+"#,
+        "at least one protocol",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp", "udp"]
+"#,
+        "duplicate protocol `udp`",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp"]
+ssl_keylog_enabled = false
+"#,
+        "secure settings but only plaintext protocols",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp"]
+tls_cert = { path = "cert.pem", private_key = "key.pem" }
+"#,
+        "secure settings but only plaintext protocols",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["tcp"]
+http_endpoint = "/dns-query"
+"#,
+        "without the `doh` protocol",
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["not-a-protocol"]
+"#,
+        "unknown variant",
+    );
+}
+
+#[test]
+fn test_reject_listener_socket_family_conflicts() {
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 0
+protocols = ["tcp", "dot"]
+tls_cert = { path = "cert.pem", private_key = "key.pem" }
+"#,
+        if cfg!(feature = "__tls") {
+            "same socket family"
+        } else {
+            "unavailable in this build"
+        },
+    );
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["doq"]
+tls_cert = { path = "cert.pem", private_key = "key.pem" }
+"#,
+        if cfg!(feature = "__quic") {
+            "same socket family"
+        } else {
+            "unavailable in this build"
+        },
+    );
+}
+
+#[cfg(feature = "__tls")]
+#[test]
+fn test_reject_secure_listener_without_certificate() {
+    invalid_listener(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["dot"]
+"#,
+        "requires `tls_cert`",
+    );
 }
 
 #[cfg(feature = "__dnssec")]
@@ -169,29 +440,6 @@ signer_name = \"ns.example.com.\"
             .unwrap()
             .unwrap(),
         Name::parse("ns.example.com.", None).unwrap()
-    );
-}
-
-#[test]
-#[cfg(feature = "__tls")]
-fn test_parse_tls() {
-    // defaults
-    let config = Config::from_toml("").unwrap();
-
-    assert_eq!(config.tls_listen_port, 853);
-    assert_eq!(config.tls_cert, None);
-
-    let config = Config::from_toml(
-        "tls_cert = { path = \"path/to/some.pkcs12\", endpoint_name = \"ns.example.com\", private_key = \"foo.pem\" }
-tls_listen_port = 8853
-  ",
-    )
-    .unwrap();
-
-    assert_eq!(config.tls_listen_port, 8853);
-    assert_eq!(
-        config.tls_cert.unwrap().path,
-        Path::new("path/to/some.pkcs12")
     );
 }
 

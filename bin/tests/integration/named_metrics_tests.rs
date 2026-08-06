@@ -11,8 +11,9 @@
 ))]
 use std::fs;
 #[cfg(all(feature = "__dnssec", feature = "sqlite"))]
-use std::{env, path::Path};
+use std::path::Path;
 use std::{
+    env,
     net::{Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
@@ -97,13 +98,10 @@ async fn test_prometheus_endpoint_startup() {
 
     // check config metrics
     let info = [("version", hickory_server::version())];
+    let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "..".to_owned());
+    let zone_directory = format!("{server_path}/tests/test-data/test_configs");
     let config_info = [
-        ("directory", "/var/named"),
-        ("disable_https", "false"),
-        ("disable_quic", "false"),
-        ("disable_tcp", "false"),
-        ("disable_tls", "false"),
-        ("disable_udp", "false"),
+        ("zone_directory", zone_directory.as_str()),
         ("allow_networks", "0"), // move to separate counter hickory_config_allow_networks_total ?
         ("deny_networks", "0"),  // move to separate counter hickory_config_deny_networks_total ?
         ("zones", "6"),          // redundant ?
@@ -192,6 +190,19 @@ async fn test_prometheus_endpoint_startup() {
     }
 
     verify_all_histograms_have_buckets(metrics);
+}
+
+#[tokio::test]
+async fn test_prometheus_disabled_without_listen_address() {
+    subscribe();
+
+    let server = TestServer::start_without_prometheus("example_forwarder.toml");
+    assert!(
+        server
+            .ports
+            .get_all(ServerProtocol::PrometheusMetrics)
+            .is_empty()
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,15 @@
+[[listeners]]
+address = "127.0.0.1"
+port = 53001
+protocols = ["udp", "tcp"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 53002
+protocols = ["udp", "tcp"]
+
+[[zones]]
+zone = "example.com"
+zone_type = "Primary"
+file = "example.com.zone"
+axfr_policy = "Deny"

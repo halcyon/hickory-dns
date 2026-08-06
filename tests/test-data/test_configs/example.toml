@@ -4,20 +4,11 @@
 ## The format is in TOML: https://github.com/toml-lang/toml which was chosen
 ## as the configuration format for Hickory DNS.
 ##
-## Many of these options are available as both command line options and
-## configuration options in these files. In that case, the command line option
-## will take precedence.
+## Server behavior is configured in this file. Command-line options select the
+## configuration file, validation mode, logging verbosity, and runtime worker count.
 ##
 ## Comments with two hash marks, ##, document the config parameter
 ## Comments with one hash mark, #, is an example line and should be the default
-
-## listen_addrs: address on which to listen for incoming connections
-##  this can be a list of ipv4 or ipv6 addresses
-# listen_addrs_ipv4 = ["0.0.0.0"]
-# listen_addrs_ipv6 = ["::0"]
-
-## listen_port: port on which to list, default 53
-# listen_port = 53
 
 ## tcp_request_timeout: TCP request timeout in seconds. Allows TCP connections
 ##  to timeout if there are no requests from a client in the specified amount of
@@ -26,19 +17,19 @@
 ##  Specifying a timeout of 0 will disable it.
 # tcp_request_timeout = 5
 
-## DNS over TLS certificate information.
-# tls_cert = { path = "path/to/some.pkcs12", password = "if_encrypted" }
+## zone_directory: path on the host filesystem where zone files and related
+##  zone data are stored.
+zone_directory = "tests/test-data/test_configs"
 
-## port on which to listen, default 853 (should not be 53)
-# tls_listen_port = 853
+## nsid: name server identifier payload for EDNS responses. Values beginning with
+##  0x are decoded as hexadecimal; other values are used as text.
+# nsid = "HickoryDNS"
+## Use the structured form to obtain the NSID payload from the system hostname.
+# nsid = { source = "hostname" }
 
-## whether to support using the SSLKEYLOGFILE environment variable for writing
-## DoT/DoH/DoQ TLS session keys to the specified file for decryption with tools
-## like Wireshark. Enable with care! The recorded data is sensitive.
-# ssl_keylog_enabled = false
-
-## directory: path on the host filesystem to where zone files are stored.
-# directory = "/var/named"
+## Prometheus settings are available when built with the prometheus-metrics feature.
+## The metrics endpoint is enabled only when a listen address is configured.
+# prometheus_listen_addr = "127.0.0.1:9000"
 
 ## Denied networks, a list of CIDRs in IPv4 or IPv6 formats,
 ##  any request that does not originate from the specified networks will be allowed
@@ -50,6 +41,47 @@
 ##  an override to the deny_networks. That is, if there is a deny_list and the network does
 ##  not appear there, even if does not appear in the allow list the request will be allowed.
 # allow_networks = ["127.0.0.0/8", "::1/128"]
+
+## Self-contained listener blocks allow one server process to bind multiple addresses and ports.
+## Secure protocol names are dot (DNS over TLS), doh (DNS over HTTP/2), and doq (DNS over QUIC).
+## Each block requires address, port, and at least one protocol. Supported protocols are udp,
+## tcp, dot, doh, and doq. A block may contain at most one TCP-family protocol (tcp, dot,
+## or doh) and one UDP-family protocol (udp or doq) for a given address and port.
+##
+## Secure listener blocks require their own tls_cert table. Relative certificate and
+## private key paths are resolved from the directory containing this TOML file.
+## endpoint_name is optional.
+## http_endpoint defaults to "/dns-query" and is only valid with doh.
+## ssl_keylog_enabled defaults to false and is only valid on secure listeners.
+##
+## At least one [[listeners]] block is required. The protocols listed in each block
+## are authoritative.
+[[listeners]]
+address = "0.0.0.0"
+port = 2053
+protocols = ["udp", "tcp"]
+#
+# [[listeners]]
+# address = "192.0.2.10"
+# port = 853
+# protocols = ["dot", "doq"]
+# ssl_keylog_enabled = false
+#
+# [listeners.tls_cert]
+# path = "sec/example.cert.pem"
+# private_key = "sec/example.key.pem"
+# endpoint_name = "ns.example.com"
+#
+# [[listeners]]
+# address = "192.0.2.10"
+# port = 443
+# protocols = ["doh"]
+# http_endpoint = "/dns-query"
+#
+# [listeners.tls_cert]
+# path = "sec/example.cert.pem"
+# private_key = "sec/example.key.pem"
+# endpoint_name = "ns.example.com"
 
 ## Default zones, these should be present on all nameservers, except in rare
 ##  configuration cases
@@ -85,7 +117,7 @@ zone = "example.com"
 ## zone_type: Primary, Secondary, External
 zone_type = "Primary"
 
-## file: this is relative to the directory above
+## file: this is relative to zone_directory
 file = "example.com.zone"
 
 ## if "Deny", AXFRs requests will result in Refused responses

@@ -1,3 +1,5 @@
+listeners = [{ address = "0.0.0.0", port = 53, protocols = ["udp", "tcp"] }, { address = "::", port = 53, protocols = ["udp", "tcp"] }]
+
 ## Test configuration for the SQLite zone store using an in-memory journal.
 
 [[zones]]

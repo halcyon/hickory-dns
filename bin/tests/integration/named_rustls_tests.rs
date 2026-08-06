@@ -26,9 +26,13 @@ use hickory_net::xfer::Protocol;
 
 #[tokio::test]
 async fn test_example_tls_toml_startup() {
+    run_tls_test("tls_config_directory/dns_over_tls_rustls_and_openssl.toml").await;
+}
+
+async fn run_tls_test(config: &str) {
     subscribe();
 
-    let server = TestServer::start("dns_over_tls_rustls_and_openssl.toml");
+    let server = TestServer::start(config);
     let mut cert_der = vec![];
     let tls_port = server.ports.get_v4(Protocol::Tls);
     let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "..".to_owned());

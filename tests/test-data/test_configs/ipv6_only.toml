@@ -1,4 +1,4 @@
-listen_addrs_ipv6 = ["::0"]
+listeners = [{ address = "::", port = 53, protocols = ["udp", "tcp"] }]
 
 [[zones]]
 zone = "example.com"

@@ -47,6 +47,35 @@ async fn test_example_toml_startup() {
 }
 
 #[tokio::test]
+async fn test_multiple_listener_ports_on_one_address() {
+    subscribe();
+    let provider = TokioRuntimeProvider::new();
+    let server = TestServer::start("multi_listeners.toml");
+
+    let tcp_addrs = server.ports.get_all(Protocol::Tcp);
+    let udp_addrs = server.ports.get_all(Protocol::Udp);
+    assert_eq!(tcp_addrs.len(), 2);
+    assert_eq!(udp_addrs.len(), 2);
+    assert_ne!(tcp_addrs[0].port(), tcp_addrs[1].port());
+    assert_ne!(udp_addrs[0].port(), udp_addrs[1].port());
+
+    for addr in tcp_addrs {
+        let (future, sender) = TcpClientStream::new(*addr, None, None, provider.clone());
+        let stream = future.await.expect("failed to create tcp stream");
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::new(stream, sender);
+        tokio::spawn(bg);
+        query_a(&mut client).await;
+    }
+
+    for addr in udp_addrs {
+        let stream = UdpClientStream::builder(*addr, provider.clone()).build();
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
+        tokio::spawn(bg);
+        query_a(&mut client).await;
+    }
+}
+
+#[tokio::test]
 async fn test_ipv4_only_toml_startup() {
     subscribe();
     let provider = TokioRuntimeProvider::new();

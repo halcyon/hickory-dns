@@ -17,12 +17,6 @@
 //!       -q, --quiet              Disable INFO messages, WARN and ERROR will remain
 //!       -d, --debug              Turn on `DEBUG` messages (default is only `INFO`)
 //!       -c, --config <NAME>      Path to configuration file of named server [default: /etc/named.toml]
-//!       -z, --zonedir <DIR>      Path to the root directory for all zone files, see also config toml
-//!       -p, --port <PORT>        Listening port for DNS queries, overrides any value in config file
-//!           --disable-tcp        Disable TCP protocol, overrides any value in config file
-//!           --disable-udp        Disable UDP protocol, overrides any value in config file
-//!           --nsid <NSID>        Name server identifier (NSID) payload for EDNS responses. Use `0x` prefix for hex-encoded data. Mutually exclusive with --nsid-hostname
-//!           --nsid-hostname      Use the system hostname as the name server identifier (NSID) payload for EDNS responses. Mutually exclusive with --nsid
 //!       -h, --help               Print help
 //!       -V, --version            Print version
 //! ```

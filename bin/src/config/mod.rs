@@ -9,12 +9,11 @@
 
 #[cfg(feature = "__tls")]
 use std::ffi::OsStr;
-#[cfg(feature = "prometheus-metrics")]
-use std::net::SocketAddr;
 use std::{
+    collections::{HashMap, HashSet},
     fmt, fs, io,
     marker::PhantomData,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -40,8 +39,6 @@ use tracing::{debug, info};
 
 #[cfg(feature = "__dnssec")]
 use crate::dnssec;
-#[cfg(feature = "__https")]
-use hickory_net::http::DEFAULT_DNS_QUERY_PATH;
 #[cfg(feature = "__tls")]
 use hickory_net::tls::default_provider;
 use hickory_proto::{ProtoError, rr::Name, serialize::txt::ParseError};
@@ -71,71 +68,23 @@ mod tests;
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    /// The list of IPv4 addresses to listen on
+    /// Self-contained DNS listener configurations.
     #[serde(default)]
-    pub(crate) listen_addrs_ipv4: Vec<Ipv4Addr>,
-    /// This list of IPv6 addresses to listen on
-    #[serde(default)]
-    pub(crate) listen_addrs_ipv6: Vec<Ipv6Addr>,
-    /// Port on which to listen (associated to all IPs)
-    #[serde(default = "default_port")]
-    pub(crate) listen_port: u16,
-    /// Secure port to listen on
-    #[cfg(feature = "__tls")]
-    #[serde(default = "default_tls_port")]
-    pub(crate) tls_listen_port: u16,
-    /// HTTPS port to listen on
-    #[cfg(feature = "__https")]
-    #[serde(default = "default_https_port")]
-    pub(crate) https_listen_port: u16,
-    /// QUIC port to listen on
-    #[cfg(feature = "__quic")]
-    #[serde(default = "default_tls_port")]
-    pub(crate) quic_listen_port: u16,
+    pub(crate) listeners: Vec<ListenerConfig>,
     /// Prometheus listen address
     #[cfg(feature = "prometheus-metrics")]
     pub(crate) prometheus_listen_addr: Option<SocketAddr>,
-    /// Disable TCP protocol
-    #[serde(default)]
-    pub(crate) disable_tcp: bool,
-    /// Disable UDP protocol
-    #[serde(default)]
-    pub(crate) disable_udp: bool,
-    /// Disable TLS protocol
-    #[cfg(feature = "__tls")]
-    #[serde(default)]
-    pub(crate) disable_tls: bool,
-    /// Disable HTTPS protocol
-    #[cfg(feature = "__https")]
-    #[serde(default)]
-    pub(crate) disable_https: bool,
-    /// Disable QUIC protocol
-    #[cfg(feature = "__quic")]
-    #[serde(default)]
-    pub(crate) disable_quic: bool,
-    /// Disable Prometheus metrics
-    #[cfg(feature = "prometheus-metrics")]
-    #[serde(default)]
-    pub(crate) disable_prometheus: bool,
+    /// Name server identifier (NSID) payload for EDNS responses.
+    pub(crate) nsid: Option<NsidConfig>,
     /// Timeout associated to a request before it is closed.
     #[serde(
         deserialize_with = "parse_request_timeout",
         default = "default_request_timeout"
     )]
     pub(crate) tcp_request_timeout: Duration,
-    /// Whether to respect the SSLKEYLOGFILE environment variable.
-    ///
-    /// This should only be enabled WITH CARE! When enabled, and the SSLKEYLOGFILE environment
-    /// variable is set, TLS session keys will be logged to the filepath specified by the
-    /// environment variable value.
-    ///
-    /// This is principally useful for decrypting captured packet data with tools like Wireshark.
-    #[cfg(feature = "__tls")]
-    #[serde(default)]
-    pub(crate) ssl_keylog_enabled: bool,
-    /// Base configuration directory, i.e. root path for zones
-    #[serde(default = "default_directory")]
-    pub(crate) directory: PathBuf,
+    /// Base directory for zone files and other zone-related data.
+    #[serde(default = "default_zone_directory")]
+    pub(crate) zone_directory: PathBuf,
     /// User to run the server as.
     ///
     /// Only supported on Unix-like platforms. If the real or effective UID of the hickory process
@@ -155,14 +104,6 @@ pub(crate) struct Config {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_with_file")]
     pub(crate) zones: Vec<ZoneConfig>,
-    /// Certificate to associate to TLS connections (currently the same is used for HTTPS and TLS)
-    #[cfg(feature = "__tls")]
-    pub(crate) tls_cert: Option<TlsCertConfig>,
-    /// The HTTP endpoint where the DNS-over-HTTPS server provides service. Applicable
-    /// to both HTTP/2 and HTTP/3 servers. Typically `/dns-query`.
-    #[cfg(feature = "__https")]
-    #[serde(default = "default_http_endpoint")]
-    pub(crate) http_endpoint: String,
     /// Networks denied to access the server
     #[serde(default)]
     pub(crate) deny_networks: Vec<IpNet>,
@@ -175,6 +116,108 @@ pub(crate) struct Config {
     /// TCP socket configuration options.
     #[serde(default)]
     pub(crate) tcp_socket: TcpSocketConfig,
+}
+
+/// Name server identifier configuration.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub(crate) enum NsidConfig {
+    /// A literal payload. Values prefixed with `0x` are decoded as hexadecimal.
+    Value(String),
+    /// A payload obtained from a runtime source.
+    Source(NsidSourceConfig),
+}
+
+/// Runtime source for an NSID payload.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NsidSourceConfig {
+    pub(crate) source: NsidSource,
+}
+
+/// Supported runtime sources for an NSID payload.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NsidSource {
+    /// Use the system hostname.
+    Hostname,
+}
+
+/// DNS service protocol exposed by a configured listener.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ListenerProtocol {
+    Udp,
+    Tcp,
+    #[serde(rename = "dot")]
+    Tls,
+    #[serde(rename = "doh")]
+    Https,
+    #[serde(rename = "doq")]
+    Quic,
+}
+
+impl fmt::Display for ListenerProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::Tls => "dot",
+            Self::Https => "doh",
+            Self::Quic => "doq",
+        };
+        formatter.write_str(value)
+    }
+}
+
+impl ListenerProtocol {
+    fn is_secure(self) -> bool {
+        matches!(self, Self::Tls | Self::Https | Self::Quic)
+    }
+
+    fn is_tcp_family(self) -> bool {
+        matches!(self, Self::Tcp | Self::Tls | Self::Https)
+    }
+
+    fn is_supported(self) -> bool {
+        match self {
+            Self::Udp | Self::Tcp => true,
+            Self::Tls => cfg!(feature = "__tls"),
+            Self::Https => cfg!(feature = "__https"),
+            Self::Quic => cfg!(feature = "__quic"),
+        }
+    }
+}
+
+/// A self-contained listener block from the configuration file.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListenerConfig {
+    pub(crate) address: IpAddr,
+    pub(crate) port: u16,
+    pub(crate) protocols: Vec<ListenerProtocol>,
+    pub(crate) tls_cert: Option<TlsCertConfig>,
+    pub(crate) http_endpoint: Option<String>,
+    pub(crate) ssl_keylog_enabled: Option<bool>,
+}
+
+/// Validated listener configuration used by server startup.
+#[derive(Clone, Debug)]
+pub(crate) struct NormalizedListener {
+    pub(crate) socket_addr: SocketAddr,
+    pub(crate) protocols: Vec<ListenerProtocol>,
+    #[cfg_attr(
+        not(any(feature = "__tls", feature = "__https", feature = "__quic")),
+        allow(dead_code)
+    )]
+    pub(crate) tls_cert: Option<TlsCertConfig>,
+    #[cfg_attr(not(feature = "__https"), allow(dead_code))]
+    pub(crate) http_endpoint: String,
+    #[cfg_attr(
+        not(any(feature = "__tls", feature = "__https", feature = "__quic")),
+        allow(dead_code)
+    )]
+    pub(crate) ssl_keylog_enabled: bool,
 }
 
 /// Configuration options for UDP sockets.
@@ -272,6 +315,115 @@ impl Config {
     /// Read a [`Config`] from the given TOML string.
     fn from_toml(toml: &str) -> Result<Self, ConfigError> {
         Ok(toml::from_str(toml)?)
+    }
+
+    /// Validate and normalize self-contained listener blocks.
+    pub(crate) fn normalized_listeners(&self) -> Result<Vec<NormalizedListener>, ConfigError> {
+        if self.listeners.is_empty() {
+            return Err(ConfigError::InvalidListener(
+                "`listeners` must contain at least one listener".to_owned(),
+            ));
+        }
+
+        let mut normalized = Vec::with_capacity(self.listeners.len());
+        let mut socket_families =
+            HashMap::<SocketAddr, (Option<ListenerProtocol>, Option<ListenerProtocol>)>::new();
+
+        for (index, listener) in self.listeners.iter().enumerate() {
+            if listener.protocols.is_empty() {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {} must contain at least one protocol",
+                    index + 1
+                )));
+            }
+
+            let mut protocols = HashSet::new();
+            for protocol in &listener.protocols {
+                if !protocols.insert(*protocol) {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "listener {} contains duplicate protocol `{protocol}`",
+                        index + 1
+                    )));
+                }
+                if !protocol.is_supported() {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "listener {} protocol `{protocol}` is unavailable in this build",
+                        index + 1
+                    )));
+                }
+            }
+
+            let has_secure_protocol = listener
+                .protocols
+                .iter()
+                .any(|protocol| protocol.is_secure());
+            let has_https = protocols.contains(&ListenerProtocol::Https);
+            if has_secure_protocol && listener.tls_cert.is_none() {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {} requires `tls_cert` for secure protocols",
+                    index + 1
+                )));
+            }
+            if !has_secure_protocol
+                && (listener.tls_cert.is_some() || listener.ssl_keylog_enabled.is_some())
+            {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {} has secure settings but only plaintext protocols",
+                    index + 1
+                )));
+            }
+            if listener.http_endpoint.is_some() && !has_https {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {} has `http_endpoint` without the `doh` protocol",
+                    index + 1
+                )));
+            }
+
+            let mut local_families = (None, None);
+            for protocol in &listener.protocols {
+                let previous = if protocol.is_tcp_family() {
+                    &mut local_families.1
+                } else {
+                    &mut local_families.0
+                };
+                if let Some(previous) = previous {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "listener {} cannot serve both `{previous}` and `{protocol}` because they use the same socket family",
+                        index + 1
+                    )));
+                }
+                *previous = Some(*protocol);
+            }
+
+            let socket_addr = SocketAddr::new(listener.address, listener.port);
+            let families = socket_families.entry(socket_addr).or_default();
+            for protocol in &listener.protocols {
+                let previous = if protocol.is_tcp_family() {
+                    &mut families.1
+                } else {
+                    &mut families.0
+                };
+                if let Some(previous) = previous {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "socket {socket_addr} cannot serve both `{previous}` and `{protocol}` because they use the same socket family"
+                    )));
+                }
+                *previous = Some(*protocol);
+            }
+
+            normalized.push(NormalizedListener {
+                socket_addr,
+                protocols: listener.protocols.clone(),
+                tls_cert: listener.tls_cert.clone(),
+                http_endpoint: listener
+                    .http_endpoint
+                    .clone()
+                    .unwrap_or_else(default_listener_http_endpoint),
+                ssl_keylog_enabled: listener.ssl_keylog_enabled.unwrap_or(false),
+            });
+        }
+
+        Ok(normalized)
     }
 }
 
@@ -688,8 +840,7 @@ where
 }
 
 /// Configuration for a TLS certificate
-#[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
-#[derive(Deserialize, PartialEq, Eq, Debug)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub(crate) struct TlsCertConfig {
@@ -701,7 +852,7 @@ pub(crate) struct TlsCertConfig {
 #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
 impl TlsCertConfig {
     /// Load a Certificate from the path (with rustls)
-    pub(crate) fn load(&self, zone_dir: &Path) -> Result<Arc<dyn ResolvesServerCert>, String> {
+    pub(crate) fn load(&self, config_dir: &Path) -> Result<Arc<dyn ResolvesServerCert>, String> {
         if let Some(endpoint_name) = &self.endpoint_name {
             info!("loading TLS cert for {endpoint_name} from {:?}", self.path);
         } else {
@@ -715,7 +866,7 @@ impl TlsCertConfig {
             ));
         }
 
-        let cert_path = zone_dir.join(&self.path);
+        let cert_path = config_dir.join(&self.path);
         info!(
             "loading TLS PEM certificate chain from: {}",
             cert_path.display()
@@ -738,12 +889,12 @@ impl TlsCertConfig {
 
         let key_extension = self.private_key.extension();
         let key = if key_extension.is_some_and(|ext| ext == "pem") {
-            let key_path = zone_dir.join(&self.private_key);
+            let key_path = config_dir.join(&self.private_key);
             info!("loading TLS PKCS8 key from PEM: {}", key_path.display());
             PrivateKeyDer::from_pem_file(&key_path)
                 .map_err(|e| format!("failed to read key from {}: {e}", key_path.display()))?
         } else if key_extension.is_some_and(|ext| ext == "der" || ext == "key") {
-            let key_path = zone_dir.join(&self.private_key);
+            let key_path = config_dir.join(&self.private_key);
             info!("loading TLS PKCS8 key from DER: {}", key_path.display());
 
             let buf =
@@ -776,6 +927,10 @@ pub(crate) enum ConfigError {
     #[error("toml decode error: {0}")]
     TomlDecode(#[from] toml::de::Error),
 
+    /// Listener configuration is semantically invalid.
+    #[error("invalid listener configuration: {0}")]
+    InvalidListener(String),
+
     /// An error occurred while parsing a zone file
     #[error("failed to parse the zone file: {0}")]
     ZoneParse(#[from] ParseError),
@@ -789,25 +944,10 @@ fn default_request_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-#[cfg(feature = "__https")]
-fn default_http_endpoint() -> String {
-    DEFAULT_DNS_QUERY_PATH.to_string()
+fn default_listener_http_endpoint() -> String {
+    "/dns-query".to_owned()
 }
 
-fn default_directory() -> PathBuf {
+fn default_zone_directory() -> PathBuf {
     PathBuf::from("/var/named") // TODO what about windows (do I care? ;)
-}
-
-fn default_port() -> u16 {
-    53
-}
-
-#[cfg(any(feature = "__tls", feature = "__quic"))]
-fn default_tls_port() -> u16 {
-    853
-}
-
-#[cfg(feature = "__https")]
-fn default_https_port() -> u16 {
-    443
 }

@@ -27,11 +27,15 @@ use test_support::subscribe;
 
 #[tokio::test]
 async fn test_example_https_toml_startup() {
+    run_https_test("dns_over_https.toml", "/dns-query").await;
+}
+
+async fn run_https_test(config: &str, http_endpoint: &str) {
     subscribe();
 
     const ALPN_H2: &[u8] = b"h2";
 
-    let server = TestServer::start("dns_over_https.toml");
+    let server = TestServer::start(config);
     let mut cert_der = vec![];
     let https_port = server.ports.get_v4(Protocol::Https);
     let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "..".to_owned());
@@ -63,7 +67,7 @@ async fn test_example_https_toml_startup() {
     let client_config = Arc::new(client_config);
     let provider = TokioRuntimeProvider::new();
     let sender = HttpsClientStream::builder(client_config, provider)
-        .build(addr, Arc::from("ns.example.com"), Arc::from("/dns-query"))
+        .build(addr, Arc::from("ns.example.com"), Arc::from(http_endpoint))
         .await
         .unwrap();
     let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(sender);

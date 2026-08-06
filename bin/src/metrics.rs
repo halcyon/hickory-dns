@@ -34,26 +34,8 @@ impl ConfigMetrics {
         );
         hickory_build_info.set(1);
 
-        #[cfg(feature = "__tls")]
-        let disable_tls = config.disable_tls;
-        #[cfg(not(feature = "__tls"))]
-        let disable_tls = false;
-        #[cfg(feature = "__https")]
-        let disable_https = config.disable_https;
-        #[cfg(not(feature = "__https"))]
-        let disable_https = false;
-        #[cfg(feature = "__quic")]
-        let disable_quic = config.disable_quic;
-        #[cfg(not(feature = "__quic"))]
-        let disable_quic = false;
-
         let hickory_config_info = gauge!(CONFIG_INFO,
-            "directory" => config.directory.to_string_lossy().to_string(),
-            "disable_udp" => config.disable_udp.to_string(),
-            "disable_tcp" => config.disable_tcp.to_string(),
-            "disable_tls" => disable_tls.to_string(),
-            "disable_https" => disable_https.to_string(),
-            "disable_quic" => disable_quic.to_string(),
+            "zone_directory" => config.zone_directory.to_string_lossy().to_string(),
             "allow_networks" => config.allow_networks.len().to_string(),
             "deny_networks" => config.deny_networks.len().to_string(),
             "zones" => config.zones.len().to_string()

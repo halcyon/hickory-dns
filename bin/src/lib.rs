@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{
     io::Error,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -36,7 +36,7 @@ use hickory_server::server::default_tls_server_config;
 use hickory_server::{server::Server, zone_handler::Catalog};
 
 mod config;
-use config::{Config, TcpSocketConfig, UdpSocketConfig};
+use config::{Config, ListenerProtocol, NsidConfig, NsidSource, TcpSocketConfig, UdpSocketConfig};
 
 #[cfg(feature = "__dnssec")]
 pub mod dnssec;
@@ -80,89 +80,6 @@ pub struct DnsServer {
         value_hint=clap::ValueHint::FilePath,
     )]
     config: PathBuf,
-
-    /// Path to the root directory for all zone files,
-    /// see also config toml
-    #[clap(short = 'z', long = "zonedir", value_name = "DIR", value_hint=clap::ValueHint::DirPath)]
-    zonedir: Option<PathBuf>,
-
-    /// Listening port for DNS queries,
-    /// overrides any value in config file
-    #[clap(short = 'p', long = "port", value_name = "PORT")]
-    port: Option<u16>,
-
-    /// Listening port for DNS over TLS queries,
-    /// overrides any value in config file
-    #[cfg(feature = "__tls")]
-    #[clap(long = "tls-port", value_name = "TLS-PORT")]
-    tls_port: Option<u16>,
-
-    /// Listening port for DNS over HTTPS queries,
-    /// overrides any value in config file
-    #[cfg(feature = "__https")]
-    #[clap(long = "https-port", value_name = "HTTPS-PORT")]
-    https_port: Option<u16>,
-
-    /// Listening port for DNS over QUIC queries,
-    /// overrides any value in config file
-    #[cfg(feature = "__quic")]
-    #[clap(long = "quic-port", value_name = "QUIC-PORT")]
-    quic_port: Option<u16>,
-
-    /// Listening socket for Prometheus metrics,
-    /// for remote access configure socket as needed (e.g. 0.0.0.0:9000)
-    /// overrides any value in config file
-    #[cfg(feature = "prometheus-metrics")]
-    #[clap(
-        long = "prometheus-listen-address",
-        value_name = "PROMETHEUS-LISTEN-ADDRESS"
-    )]
-    prometheus_listen_addr: Option<SocketAddr>,
-
-    /// Disable TCP protocol,
-    /// overrides any value in config file
-    #[clap(long = "disable-tcp")]
-    disable_tcp: bool,
-
-    /// Disable UDP protocol,
-    /// overrides any value in config file
-    #[clap(long = "disable-udp")]
-    disable_udp: bool,
-
-    /// Disable TLS protocol,
-    /// overrides any value in config file
-    #[cfg(feature = "__tls")]
-    #[clap(long = "disable-tls", conflicts_with = "tls_port")]
-    disable_tls: bool,
-
-    /// Disable HTTPS protocol,
-    /// overrides any value in config file
-    #[cfg(feature = "__https")]
-    #[clap(long = "disable-https", conflicts_with = "https_port")]
-    disable_https: bool,
-
-    /// Disable QUIC protocol,
-    /// overrides any value in config file
-    #[cfg(feature = "__quic")]
-    #[clap(long = "disable-quic", conflicts_with = "quic_port")]
-    disable_quic: bool,
-
-    /// Disable Prometheus metrics,
-    /// overrides any value in config file
-    #[cfg(feature = "prometheus-metrics")]
-    #[clap(long = "disable-prometheus", conflicts_with = "prometheus_listen_addr")]
-    disable_prometheus: bool,
-
-    /// Name server identifier (NSID) payload for EDNS responses.
-    /// Use `0x` prefix for hex-encoded data. Mutually exclusive with --nsid-hostname
-    #[clap(long = "nsid", value_name = "NSID", conflicts_with = "nsid_hostname", value_parser = parse_nsid_payload)]
-    nsid: Option<NSIDPayload>,
-
-    /// Use the system hostname as the name server identifier (NSID) payload
-    /// for EDNS responses.
-    /// Mutually exclusive with --nsid
-    #[clap(long = "nsid-hostname", conflicts_with = "nsid")]
-    nsid_hostname: bool,
 }
 
 impl DnsServer {
@@ -173,53 +90,23 @@ impl DnsServer {
             quiet: _,   // Used in `main()`
             debug: _,   // Used in `main()`
             config,
-            zonedir,
-            port,
-            #[cfg(feature = "__tls")]
-            tls_port,
-            #[cfg(feature = "__https")]
-            https_port,
-            #[cfg(feature = "__quic")]
-            quic_port,
-            #[cfg(feature = "prometheus-metrics")]
-            prometheus_listen_addr,
-            disable_tcp,
-            disable_udp,
-            #[cfg(feature = "__tls")]
-            disable_tls,
-            #[cfg(feature = "__https")]
-            disable_https,
-            #[cfg(feature = "__quic")]
-            disable_quic,
-            #[cfg(feature = "prometheus-metrics")]
-            disable_prometheus,
-            nsid,
-            nsid_hostname,
         } = self;
 
         let config_path = Path::new(&config);
+        #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
+        let config_directory = config_path.parent().unwrap_or_else(|| Path::new("."));
         info!("loading configuration from: {config_path:?}");
         let config = Config::read_config(config_path)
             .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
 
-        #[cfg(feature = "prometheus-metrics")]
-        let disable_prometheus = disable_prometheus | config.disable_prometheus;
-        let disable_udp = disable_udp | config.disable_udp;
-        let disable_tcp = disable_tcp | config.disable_tcp;
-        #[cfg(feature = "__tls")]
-        let disable_tls = disable_tls | config.disable_tls;
-        #[cfg(feature = "__https")]
-        let disable_https = disable_https | config.disable_https;
-        #[cfg(feature = "__quic")]
-        let disable_quic = disable_quic | config.disable_quic;
+        let listeners = config
+            .normalized_listeners()
+            .map_err(|err| format!("failed to validate {config_path:?}: {err}"))?;
+
+        let nsid = configured_nsid(config.nsid.as_ref())?;
 
         #[cfg(feature = "prometheus-metrics")]
-        let prometheus_server_opt = if !disable_prometheus {
-            let socket_addr = prometheus_listen_addr.unwrap_or_else(|| {
-                config
-                    .prometheus_listen_addr
-                    .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9000))
-            });
+        let prometheus_server_opt = if let Some(socket_addr) = config.prometheus_listen_addr {
             let listener = build_tcp_listener(
                 socket_addr.ip(),
                 socket_addr.port(),
@@ -261,39 +148,16 @@ impl DnsServer {
         };
 
         let Config {
-            listen_addrs_ipv4,
-            listen_addrs_ipv6,
-            listen_port,
-            #[cfg(feature = "__tls")]
-            tls_listen_port,
-            #[cfg(feature = "__https")]
-            https_listen_port,
-            #[cfg(feature = "__quic")]
-            quic_listen_port,
+            listeners: _,
             #[cfg(feature = "prometheus-metrics")]
                 prometheus_listen_addr: _,
-            disable_tcp: _,
-            disable_udp: _,
-            #[cfg(feature = "__tls")]
-                disable_tls: _,
-            #[cfg(feature = "__https")]
-                disable_https: _,
-            #[cfg(feature = "__quic")]
-                disable_quic: _,
-            #[cfg(feature = "prometheus-metrics")]
-                disable_prometheus: _,
+            nsid: _,
             tcp_request_timeout,
-            #[cfg(feature = "__tls")]
-            ssl_keylog_enabled,
-            directory,
+            zone_directory,
             user,
             group,
             zones,
             drop_privileges,
-            #[cfg(feature = "__tls")]
-            tls_cert,
-            #[cfg(feature = "__https")]
-            http_endpoint,
             deny_networks,
             allow_networks,
             udp_socket: udp_socket_config,
@@ -307,16 +171,6 @@ impl DnsServer {
         let mut catalog = Catalog::new();
         catalog.set_nsid(nsid);
 
-        if nsid_hostname {
-            let hostname =
-                hostname::get().map_err(|e| format!("failed to get system hostname: {e}"))?;
-            let payload = NSIDPayload::new(hostname.into_encoded_bytes())
-                .map_err(|e| format!("invalid NSID payload: {e}"))?;
-            catalog.set_nsid(Some(payload));
-        }
-
-        // configure our server based on the config_path
-        let zone_dir = zonedir.unwrap_or(directory);
         for zone in zones {
             let zone_name = zone
                 .zone()
@@ -325,7 +179,7 @@ impl DnsServer {
             #[cfg(feature = "metrics")]
             config_metrics.increment_zone_metrics(&zone);
 
-            match zone.load(&zone_dir).await {
+            match zone.load(&zone_directory).await {
                 Ok(handlers) => catalog.upsert(zone_name.into(), handlers),
                 Err(err) => return Err(format!("could not load zone {zone_name}: {err}")),
             }
@@ -340,78 +194,63 @@ impl DnsServer {
         #[cfg_attr(not(feature = "__tls"), allow(unused_mut))]
         let mut server = Server::with_access(catalog, deny_networks, allow_networks);
 
-        let mut listen_addrs = listen_addrs_ipv4
-            .into_iter()
-            .map(IpAddr::V4)
-            .chain(listen_addrs_ipv6.into_iter().map(IpAddr::V6))
-            .collect::<Vec<_>>();
-
-        if listen_addrs.is_empty() {
-            listen_addrs.push(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-            listen_addrs.push(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-        }
-
         let mut setup = ServerSetup {
-            listen_addrs,
             server: &mut server,
             tcp_request_timeout,
+            udp_socket_config,
+            tcp_socket_config,
+        };
+
+        for listener in listeners {
             #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
-            cert_resolver: tls_cert
+            let cert_resolver = listener
+                .tls_cert
                 .as_ref()
                 .map(|config| {
-                    config.load(&zone_dir).map_err(|err| {
+                    config.load(config_directory).map_err(|err| {
                         format!(
                             "failed to load TLS certificate from {:?}: {err}",
                             config.path
                         )
                     })
                 })
-                .transpose()?,
-            #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
-            ssl_keylog_enabled,
-            udp_socket_config,
-            tcp_socket_config,
-        };
+                .transpose()?;
 
-        let listen_port = port.unwrap_or(listen_port);
-        match disable_udp {
-            true => info!("UDP protocol is disabled"),
-            false => setup.udp(listen_port)?,
-        }
-
-        match disable_tcp {
-            true => info!("TCP protocol is disabled"),
-            false => setup.tcp(listen_port)?,
-        }
-
-        #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
-        if setup.cert_resolver.is_none() {
-            info!("TLS certificates are not provided");
-            info!("TLS related protocols (TLS, HTTPS and QUIC) are disabled")
-        }
-
-        #[cfg(feature = "__tls")]
-        match disable_tls {
-            true => info!("TLS protocol is disabled"),
-            false => setup.tls(tls_port.unwrap_or(tls_listen_port))?,
-        }
-
-        #[cfg(feature = "__https")]
-        match disable_https {
-            true => info!("HTTPS protocol is disabled"),
-            false => setup.https(
-                https_port.unwrap_or(https_listen_port),
-                &http_endpoint,
-                tls_cert
-                    .as_ref()
-                    .and_then(|config| config.endpoint_name.as_deref()),
-            )?,
-        }
-
-        #[cfg(feature = "__quic")]
-        match disable_quic {
-            true => info!("QUIC protocol is disabled"),
-            false => setup.quic(quic_port.unwrap_or(quic_listen_port))?,
+            for protocol in listener.protocols {
+                match protocol {
+                    ListenerProtocol::Udp => setup.udp(listener.socket_addr)?,
+                    ListenerProtocol::Tcp => setup.tcp(listener.socket_addr)?,
+                    ListenerProtocol::Tls => {
+                        #[cfg(feature = "__tls")]
+                        setup.tls(
+                            listener.socket_addr,
+                            cert_resolver.as_ref(),
+                            listener.ssl_keylog_enabled,
+                        )?;
+                    }
+                    ListenerProtocol::Https => {
+                        #[cfg(feature = "__https")]
+                        setup.https(
+                            listener.socket_addr,
+                            cert_resolver.as_ref(),
+                            listener.ssl_keylog_enabled,
+                            &listener.http_endpoint,
+                            listener
+                                .tls_cert
+                                .as_ref()
+                                .and_then(|config| config.endpoint_name.as_deref()),
+                        )?;
+                    }
+                    ListenerProtocol::Quic => {
+                        #[cfg(feature = "__quic")]
+                        setup.quic(
+                            listener.socket_addr,
+                            cert_resolver.as_ref(),
+                            listener.ssl_keylog_enabled,
+                        )?;
+                    }
+                }
+            }
         }
 
         // Drop privileges on Unix systems if running as root.
@@ -499,190 +338,202 @@ impl DnsServer {
 }
 
 struct ServerSetup<'a> {
-    listen_addrs: Vec<IpAddr>,
     server: &'a mut Server<Catalog>,
     tcp_request_timeout: Duration,
-    #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
-    cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
-    #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
-    ssl_keylog_enabled: bool,
     udp_socket_config: UdpSocketConfig,
     tcp_socket_config: TcpSocketConfig,
 }
 
 impl ServerSetup<'_> {
-    fn udp(&mut self, port: u16) -> Result<(), String> {
+    fn udp(&mut self, socket_addr: SocketAddr) -> Result<(), String> {
         #[cfg(unix)]
         let num_sockets = self.udp_socket_config.sockets.unwrap_or(1);
         #[cfg(not(unix))]
         let num_sockets = 1_usize;
-        for addr in &self.listen_addrs {
-            info!("binding {num_sockets} UDP socket(s) to {addr:?}:{port}");
+        info!("binding {num_sockets} UDP socket(s) to {socket_addr}");
 
-            // Bind the first socket up-front so we can log the local address. This is helpful
-            // when binding :0 and allowing the OS to choose the listen port.
-            let first_socket = build_udp_socket(*addr, port, self.udp_socket_config)
-                .map_err(|err| format!("failed to bind to UDP socket address {addr:?}: {err}"))?;
-            let bound_addr = first_socket
-                .local_addr()
-                .map_err(|err| format!("failed to lookup local address: {err}"))?;
-            self.server.register_socket(first_socket);
+        // Bind the first socket up-front so we can log the local address. This is helpful
+        // when binding :0 and allowing the OS to choose the listen port.
+        let first_socket =
+            build_udp_socket(socket_addr.ip(), socket_addr.port(), self.udp_socket_config)
+                .map_err(|err| {
+                    format!("failed to bind to UDP socket address {socket_addr}: {err}")
+                })?;
+        let bound_addr = first_socket
+            .local_addr()
+            .map_err(|err| format!("failed to lookup local address: {err}"))?;
+        self.server.register_socket(first_socket);
 
-            // Afterward, bind any additional sockets.
-            for _ in 1..num_sockets {
-                self.server.register_socket(
-                    build_udp_socket(*addr, port, self.udp_socket_config).map_err(|err| {
-                        format!("failed to bind to UDP socket address {addr:?}: {err}")
+        // Afterward, bind any additional sockets.
+        for _ in 1..num_sockets {
+            self.server.register_socket(
+                build_udp_socket(socket_addr.ip(), socket_addr.port(), self.udp_socket_config)
+                    .map_err(|err| {
+                        format!("failed to bind to UDP socket address {socket_addr}: {err}")
                     })?,
-                );
-            }
-
-            info!("listening for UDP on {bound_addr:?}");
+            );
         }
+
+        info!("listening for UDP on {bound_addr:?}");
 
         Ok(())
     }
 
-    fn tcp(&mut self, port: u16) -> Result<(), String> {
-        for addr in &self.listen_addrs {
-            info!("binding TCP to {addr:?}");
+    fn tcp(&mut self, socket_addr: SocketAddr) -> Result<(), String> {
+        info!("binding TCP to {socket_addr}");
 
-            let tcp_listener = build_tcp_listener(*addr, port, self.tcp_socket_config)
-                .map_err(|err| format!("failed to bind to TCP socket address {addr:?}: {err}"))?;
+        let tcp_listener =
+            build_tcp_listener(socket_addr.ip(), socket_addr.port(), self.tcp_socket_config)
+                .map_err(|err| {
+                    format!("failed to bind to TCP socket address {socket_addr}: {err}")
+                })?;
 
-            info!(
-                "listening for TCP on {:?}",
-                tcp_listener
-                    .local_addr()
-                    .map_err(|err| format!("failed to lookup local address: {err}"))?
-            );
+        info!(
+            "listening for TCP on {:?}",
+            tcp_listener
+                .local_addr()
+                .map_err(|err| format!("failed to lookup local address: {err}"))?
+        );
 
-            self.server.register_listener(
-                tcp_listener,
-                self.tcp_request_timeout,
-                self.tcp_socket_config.response_buffer_size,
-            );
-        }
+        self.server.register_listener(
+            tcp_listener,
+            self.tcp_request_timeout,
+            self.tcp_socket_config.response_buffer_size,
+        );
 
         Ok(())
     }
 
     #[cfg(feature = "__tls")]
-    fn tls(&mut self, port: u16) -> Result<(), String> {
-        let Some(cert_resolver) = &self.cert_resolver else {
+    fn tls(
+        &mut self,
+        socket_addr: SocketAddr,
+        cert_resolver: Option<&Arc<dyn ResolvesServerCert>>,
+        ssl_keylog_enabled: bool,
+    ) -> Result<(), String> {
+        let Some(cert_resolver) = cert_resolver else {
             return Ok(());
         };
 
-        for addr in &self.listen_addrs {
-            info!("binding TLS to {addr:?}");
+        info!("binding TLS to {socket_addr}");
 
-            let tls_listener = build_tcp_listener(*addr, port, self.tcp_socket_config)
-                .map_err(|err| format!("failed to bind to TLS socket address {addr:?}: {err}"))?;
+        let tls_listener =
+            build_tcp_listener(socket_addr.ip(), socket_addr.port(), self.tcp_socket_config)
+                .map_err(|err| {
+                    format!("failed to bind to TLS socket address {socket_addr}: {err}")
+                })?;
 
-            info!(
-                "listening for TLS on {:?}",
-                tls_listener
-                    .local_addr()
-                    .map_err(|err| format!("failed to lookup local address: {err}"))?
-            );
+        info!(
+            "listening for TLS on {:?}",
+            tls_listener
+                .local_addr()
+                .map_err(|err| format!("failed to lookup local address: {err}"))?
+        );
 
-            let mut tls_config = default_tls_server_config(b"dot", cert_resolver.clone())
-                .map_err(|err| format!("failed to build default TLS config: {err}"))?;
-            if self.ssl_keylog_enabled {
-                warn!("DoT SSL_KEYLOG_FILE support enabled");
-                tls_config.key_log = Arc::new(KeyLogFile::new());
-            }
-
-            self.server
-                .register_tls_listener_with_tls_config(
-                    tls_listener,
-                    self.tcp_request_timeout,
-                    Arc::new(tls_config),
-                )
-                .map_err(|err| format!("failed to register TLS listener: {err}"))?;
+        let mut tls_config = default_tls_server_config(b"dot", cert_resolver.clone())
+            .map_err(|err| format!("failed to build default TLS config: {err}"))?;
+        if ssl_keylog_enabled {
+            warn!("DoT SSL_KEYLOG_FILE support enabled");
+            tls_config.key_log = Arc::new(KeyLogFile::new());
         }
+
+        self.server
+            .register_tls_listener_with_tls_config(
+                tls_listener,
+                self.tcp_request_timeout,
+                Arc::new(tls_config),
+            )
+            .map_err(|err| format!("failed to register TLS listener: {err}"))?;
         Ok(())
     }
 
     #[cfg(feature = "__https")]
     fn https(
         &mut self,
-        port: u16,
+        socket_addr: SocketAddr,
+        cert_resolver: Option<&Arc<dyn ResolvesServerCert>>,
+        ssl_keylog_enabled: bool,
         http_endpoint: &str,
         dns_hostname: Option<&str>,
     ) -> Result<(), String> {
-        let Some(cert_resolver) = &self.cert_resolver else {
+        let Some(cert_resolver) = cert_resolver else {
             return Ok(());
         };
 
-        for addr in &self.listen_addrs {
-            info!("binding HTTPS to {addr:?}");
+        info!("binding HTTPS to {socket_addr}");
 
-            let https_listener = build_tcp_listener(*addr, port, self.tcp_socket_config)
-                .map_err(|err| format!("failed to bind to HTTPS socket address {addr:?}: {err}"))?;
+        let https_listener =
+            build_tcp_listener(socket_addr.ip(), socket_addr.port(), self.tcp_socket_config)
+                .map_err(|err| {
+                    format!("failed to bind to HTTPS socket address {socket_addr}: {err}")
+                })?;
 
-            info!(
-                "listening for HTTPS on {:?}",
-                https_listener
-                    .local_addr()
-                    .map_err(|err| format!("failed to lookup local address: {err}"))?
-            );
+        info!(
+            "listening for HTTPS on {:?}",
+            https_listener
+                .local_addr()
+                .map_err(|err| format!("failed to lookup local address: {err}"))?
+        );
 
-            let mut tls_config = default_tls_server_config(b"h2", cert_resolver.clone())
-                .map_err(|err| format!("failed to build default TLS config: {err}"))?;
-            if self.ssl_keylog_enabled {
-                warn!("DoH SSL_KEYLOG_FILE support enabled");
-                tls_config.key_log = Arc::new(KeyLogFile::new());
-            }
-
-            self.server
-                .register_https_listener_with_tls_config(
-                    https_listener,
-                    self.tcp_request_timeout,
-                    Arc::new(tls_config),
-                    dns_hostname.map(|s| s.to_owned()),
-                    http_endpoint.to_owned(),
-                )
-                .map_err(|err| format!("failed to register HTTPS listener: {err}"))?;
+        let mut tls_config = default_tls_server_config(b"h2", cert_resolver.clone())
+            .map_err(|err| format!("failed to build default TLS config: {err}"))?;
+        if ssl_keylog_enabled {
+            warn!("DoH SSL_KEYLOG_FILE support enabled");
+            tls_config.key_log = Arc::new(KeyLogFile::new());
         }
 
+        self.server
+            .register_https_listener_with_tls_config(
+                https_listener,
+                self.tcp_request_timeout,
+                Arc::new(tls_config),
+                dns_hostname.map(|s| s.to_owned()),
+                http_endpoint.to_owned(),
+            )
+            .map_err(|err| format!("failed to register HTTPS listener: {err}"))?;
         Ok(())
     }
 
     #[cfg(feature = "__quic")]
-    fn quic(&mut self, port: u16) -> Result<(), String> {
-        let Some(cert_resolver) = &self.cert_resolver else {
+    fn quic(
+        &mut self,
+        socket_addr: SocketAddr,
+        cert_resolver: Option<&Arc<dyn ResolvesServerCert>>,
+        ssl_keylog_enabled: bool,
+    ) -> Result<(), String> {
+        let Some(cert_resolver) = cert_resolver else {
             return Ok(());
         };
 
-        for addr in &self.listen_addrs {
-            info!("Binding QUIC to {addr:?}");
+        info!("Binding QUIC to {socket_addr}");
 
-            let quic_listener = build_udp_socket(*addr, port, self.udp_socket_config)
-                .map_err(|err| format!("failed to bind to QUIC socket address {addr:?}: {err}"))?;
+        let quic_listener =
+            build_udp_socket(socket_addr.ip(), socket_addr.port(), self.udp_socket_config)
+                .map_err(|err| {
+                    format!("failed to bind to QUIC socket address {socket_addr}: {err}")
+                })?;
 
-            info!(
-                "listening for QUIC on {:?}",
-                quic_listener
-                    .local_addr()
-                    .map_err(|err| format!("failed to lookup local address: {err}"))?
-            );
+        info!(
+            "listening for QUIC on {:?}",
+            quic_listener
+                .local_addr()
+                .map_err(|err| format!("failed to lookup local address: {err}"))?
+        );
 
-            let mut tls_config = default_tls_server_config(b"doq", cert_resolver.clone())
-                .map_err(|err| format!("failed to build default TLS config: {err}"))?;
-            if self.ssl_keylog_enabled {
-                warn!("DoQ SSL_KEYLOG_FILE support enabled");
-                tls_config.key_log = Arc::new(KeyLogFile::new());
-            }
-
-            self.server
-                .register_quic_listener_and_tls_config(
-                    quic_listener,
-                    self.tcp_request_timeout,
-                    Arc::new(tls_config),
-                )
-                .map_err(|err| format!("failed to register QUIC listener: {err}"))?;
+        let mut tls_config = default_tls_server_config(b"doq", cert_resolver.clone())
+            .map_err(|err| format!("failed to build default TLS config: {err}"))?;
+        if ssl_keylog_enabled {
+            warn!("DoQ SSL_KEYLOG_FILE support enabled");
+            tls_config.key_log = Arc::new(KeyLogFile::new());
         }
+
+        self.server
+            .register_quic_listener_and_tls_config(
+                quic_listener,
+                self.tcp_request_timeout,
+                Arc::new(tls_config),
+            )
+            .map_err(|err| format!("failed to register QUIC listener: {err}"))?;
         Ok(())
     }
 }
@@ -863,6 +714,27 @@ fn parse_nsid_payload(raw_payload: &str) -> Result<NSIDPayload, ProtoError> {
     NSIDPayload::new(bytes)
 }
 
+fn configured_nsid(config: Option<&NsidConfig>) -> Result<Option<NSIDPayload>, String> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    match config {
+        NsidConfig::Value(value) => parse_nsid_payload(value)
+            .map(Some)
+            .map_err(|err| format!("invalid NSID payload: {err}")),
+        NsidConfig::Source(source) => match source.source {
+            NsidSource::Hostname => {
+                let hostname = hostname::get()
+                    .map_err(|err| format!("failed to get system hostname: {err}"))?;
+                NSIDPayload::new(hostname.into_encoded_bytes())
+                    .map(Some)
+                    .map_err(|err| format!("invalid NSID payload: {err}"))
+            }
+        },
+    }
+}
+
 #[cfg(target_family = "unix")]
 const DEFAULT_USER: &str = "nobody";
 #[cfg(target_family = "unix")]
@@ -872,7 +744,8 @@ const DEFAULT_GROUP: &str = "nobody";
 mod tests {
     use hickory_proto::rr::rdata::opt::NSIDPayload;
 
-    use super::parse_nsid_payload;
+    use super::{configured_nsid, parse_nsid_payload};
+    use crate::config::{NsidConfig, NsidSource, NsidSourceConfig};
 
     #[test]
     fn test_hex_nsid_payload() {
@@ -894,5 +767,20 @@ mod tests {
         let too_large = "x".repeat(u16::MAX as usize + 1);
         let err = parse_nsid_payload(&too_large).unwrap_err();
         assert_eq!(err.to_string(), "NSID EDNS payload too large");
+    }
+
+    #[test]
+    fn test_nsid_configuration_disabled_by_default() {
+        assert_eq!(configured_nsid(None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_hostname_nsid_source() {
+        let config = NsidConfig::Source(NsidSourceConfig {
+            source: NsidSource::Hostname,
+        });
+        let expected = NSIDPayload::new(hostname::get().unwrap().into_encoded_bytes()).unwrap();
+
+        assert_eq!(configured_nsid(Some(&config)).unwrap(), Some(expected));
     }
 }

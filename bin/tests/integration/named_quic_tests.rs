@@ -22,9 +22,13 @@ use test_support::subscribe;
 
 #[tokio::test]
 async fn test_example_quic_toml_startup() {
+    run_quic_test("dns_over_quic.toml").await;
+}
+
+async fn run_quic_test(config: &str) {
     subscribe();
 
-    let server = TestServer::start("dns_over_quic.toml");
+    let server = TestServer::start(config);
     let mut cert_der = vec![];
     let quic_port = server.ports.get_v4(Protocol::Quic);
     let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "..".to_owned());

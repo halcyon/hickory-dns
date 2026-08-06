@@ -31,16 +31,24 @@ fn find_test_port() -> u16 {
 
 struct NamedProcess {
     named: Child,
+    temporary_config: Option<std::path::PathBuf>,
 }
 
 impl Drop for NamedProcess {
     fn drop(&mut self) {
         self.named.kill().expect("could not kill process");
         self.named.wait().expect("waiting failed");
+        if let Some(path) = &self.temporary_config {
+            std::fs::remove_file(path).expect("failed to remove temporary benchmark config");
+        }
     }
 }
 
-fn wrap_process(named: Child, server_port: u16) -> NamedProcess {
+fn wrap_process(
+    named: Child,
+    server_port: u16,
+    temporary_config: Option<std::path::PathBuf>,
+) -> NamedProcess {
     let mut started = false;
     let provider = TokioRuntimeProvider::new();
 
@@ -64,38 +72,66 @@ fn wrap_process(named: Child, server_port: u16) -> NamedProcess {
     }
 
     assert!(started, "server did not startup...");
-    // return handle to child process
-    NamedProcess { named }
+    NamedProcess {
+        named,
+        temporary_config,
+    }
 }
 
 /// Returns a NamedProcess (cleans the process up on drop), and a socket addr for connecting
 ///  to the server.
 fn hickory_process() -> (NamedProcess, u16) {
-    // find a random port to listen on
     let test_port = find_test_port();
 
     let ws_root = env::var("WORKSPACE_ROOT").unwrap_or_else(|_| "..".to_owned());
     let named_path = env!("CARGO_BIN_EXE_hickory-dns");
-    let config_path = format!("{}/tests/test-data/test_configs/example.toml", ws_root);
-    let zone_dir = format!("{}/tests/test-data/test_configs", ws_root);
+    let source_config_path = std::path::PathBuf::from(format!(
+        "{ws_root}/tests/test-data/test_configs/example.toml"
+    ));
+    let zone_directory = format!("{ws_root}/tests/test-data/test_configs");
 
-    File::open(&named_path).expect(&named_path);
-    File::open(&config_path).expect(&config_path);
-    File::open(&zone_dir).expect(&zone_dir);
+    File::open(named_path).expect(named_path);
+    File::open(&source_config_path).expect("failed to open benchmark configuration");
+    File::open(&zone_directory).expect(&zone_directory);
 
-    let named = Command::new(&named_path)
+    let contents =
+        std::fs::read_to_string(&source_config_path).expect("failed to read benchmark config");
+    let mut config =
+        toml::from_str::<toml::Value>(&contents).expect("failed to parse benchmark config");
+    config
+        .as_table_mut()
+        .expect("benchmark configuration must be a table")
+        .insert(
+            "zone_directory".to_owned(),
+            toml::Value::String(zone_directory.clone()),
+        );
+    let listener = config
+        .get_mut("listeners")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|listeners| listeners.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .expect("benchmark configuration must contain a listener");
+    listener.insert(
+        "port".to_owned(),
+        toml::Value::Integer(i64::from(test_port)),
+    );
+
+    let config_path =
+        env::temp_dir().join(format!("hickory-dns-benchmark-{}.toml", std::process::id()));
+    std::fs::write(
+        &config_path,
+        toml::to_string(&config).expect("failed to serialize benchmark config"),
+    )
+    .expect("failed to write benchmark config");
+
+    let named = Command::new(named_path)
         .stdout(Stdio::null())
-        .arg("-q") // TODO: need to rethink this one...
-        .arg(&format!("--config={}", config_path))
-        .arg(&format!("--zonedir={}", zone_dir))
-        .arg(&format!("--port={}", test_port))
+        .arg("-q")
+        .arg(format!("--config={}", config_path.display()))
         .spawn()
         .expect("failed to start hickory-dns");
-    //
 
-    let process = wrap_process(named, test_port);
-
-    // return handle to child process
+    let process = wrap_process(named, test_port, Some(config_path));
     (process, test_port)
 }
 
@@ -199,7 +235,7 @@ fn bind_process() -> (NamedProcess, u16) {
         .expect("failed to start named");
 
     mem::replace(&mut named.stderr, None).unwrap();
-    let process = wrap_process(named, test_port);
+    let process = wrap_process(named, test_port, None);
     (process, test_port)
 }
 

@@ -321,4 +321,4 @@ init: init-cargo-workspaces init-audit
 
 # Run the server with example config, for manual testing purposes
 run-example:
-    @cargo {{MSRV}} run --bin hickory-dns --locked -- -d -c {{TEST_DATA}}/test_configs/example.toml -z {{TEST_DATA}}/test_configs -p 2053
+    @cargo {{MSRV}} run --bin hickory-dns --locked -- -d -c {{TEST_DATA}}/test_configs/example.toml

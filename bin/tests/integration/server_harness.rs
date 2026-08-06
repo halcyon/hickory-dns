@@ -28,41 +28,38 @@ use hickory_proto::{
 #[cfg(feature = "__dnssec")]
 use hickory_server::zone_handler::LookupOptions;
 
-#[derive(Debug, Default)]
-struct SocketPort {
-    v4: u16,
-    v6: u16,
-}
+use std::path::PathBuf;
 
 #[derive(Debug, Default)]
-pub struct SocketPorts(HashMap<ServerProtocol, SocketPort>);
+pub struct SocketPorts(HashMap<ServerProtocol, Vec<SocketAddr>>);
 
 impl SocketPorts {
-    /// This will overwrite the existing value
     fn put(&mut self, protocol: impl Into<ServerProtocol>, addr: SocketAddr) {
-        let entry = self.0.entry(protocol.into()).or_default();
-
-        if addr.is_ipv4() {
-            entry.v4 = addr.port();
-        } else {
-            entry.v6 = addr.port();
-        }
+        self.0.entry(protocol.into()).or_default().push(addr);
     }
 
-    /// Assumes there is only one V4 addr for the IP based on the usage in the Server
+    /// Returns the first recorded IPv4 port for compatibility with single-listener tests.
     pub fn get_v4(&self, protocol: impl Into<ServerProtocol>) -> Option<u16> {
         self.0
             .get(&protocol.into())
-            .iter()
-            .find_map(|ports| if ports.v4 == 0 { None } else { Some(ports.v4) })
+            .and_then(|addrs| addrs.iter().find(|addr| addr.is_ipv4()))
+            .map(SocketAddr::port)
     }
 
-    /// Assumes there is only one V4 addr for the IP based on the usage in the Server
+    /// Returns the first recorded IPv6 port for compatibility with single-listener tests.
     pub fn get_v6(&self, protocol: impl Into<ServerProtocol>) -> Option<u16> {
         self.0
             .get(&protocol.into())
-            .iter()
-            .find_map(|ports| if ports.v6 == 0 { None } else { Some(ports.v6) })
+            .and_then(|addrs| addrs.iter().find(|addr| addr.is_ipv6()))
+            .map(SocketAddr::port)
+    }
+
+    /// Returns every socket address recorded for a protocol.
+    pub fn get_all(&self, protocol: impl Into<ServerProtocol>) -> &[SocketAddr] {
+        self.0
+            .get(&protocol.into())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
@@ -89,18 +86,131 @@ fn collect_and_print<R: BufRead>(read: &mut R, output: &mut String) {
     }
 }
 
+fn unused_dns_port() -> u16 {
+    loop {
+        let tcp = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve an ephemeral TCP port");
+        let port = tcp.local_addr().unwrap().port();
+        if let Ok(udp) = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+            drop(udp);
+            drop(tcp);
+            return port;
+        }
+    }
+}
+
+fn temporary_server_config(
+    original_config_path: &std::path::Path,
+    zone_directory: &std::path::Path,
+    enable_prometheus: bool,
+) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
+
+    let contents =
+        std::fs::read_to_string(original_config_path).expect("failed to read server configuration");
+    let mut config =
+        toml::from_str::<toml::Value>(&contents).expect("failed to parse server configuration");
+    let config_table = config
+        .as_table_mut()
+        .expect("server configuration must be a table");
+    config_table.insert(
+        "zone_directory".to_owned(),
+        toml::Value::String(zone_directory.to_string_lossy().into_owned()),
+    );
+    #[cfg(feature = "prometheus-metrics")]
+    if enable_prometheus {
+        config_table.insert(
+            "prometheus_listen_addr".to_owned(),
+            toml::Value::String("127.0.0.1:0".to_owned()),
+        );
+    }
+    #[cfg(not(feature = "prometheus-metrics"))]
+    let _ = enable_prometheus;
+    let listeners = config
+        .get_mut("listeners")
+        .and_then(toml::Value::as_array_mut)
+        .filter(|listeners| !listeners.is_empty())
+        .expect("server test configuration must contain at least one listener");
+
+    if listeners.len() == 1 {
+        listeners[0]
+            .as_table_mut()
+            .expect("listener must be a table")
+            .insert("port".to_owned(), toml::Value::Integer(0));
+    } else {
+        let mut assigned_ports = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let mut port = unused_dns_port();
+            while assigned_ports.contains(&port) {
+                port = unused_dns_port();
+            }
+            assigned_ports.push(port);
+            listener
+                .as_table_mut()
+                .expect("listener must be a table")
+                .insert("port".to_owned(), toml::Value::Integer(i64::from(port)));
+        }
+    }
+
+    let config_id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
+    // Keep the generated configuration beside the source configuration so relative TLS paths
+    // continue to exercise config-directory-relative resolution.
+    let path = original_config_path
+        .parent()
+        .expect("server configuration must have a parent directory")
+        .join(format!(
+            ".hickory-dns-test-{}-{config_id}.tmp",
+            std::process::id()
+        ));
+    std::fs::write(
+        &path,
+        toml::to_string(&config).expect("failed to serialize server configuration"),
+    )
+    .expect("failed to write temporary server configuration");
+    path
+}
+
+struct TemporaryConfig(PathBuf);
+
+impl Drop for TemporaryConfig {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            warn!(path = %self.0.display(), %error, "failed to remove temporary server config");
+        }
+    }
+}
+
 pub struct TestServer {
     pub ports: SocketPorts,
     child: Child,
     stdout: BufReader<ChildStdout>,
+    _temporary_config: TemporaryConfig,
 }
 
 impl TestServer {
     /// Spins up a Server and handles shutting it down after running the test
     #[allow(dead_code)]
     pub fn start(toml: &str) -> Self {
+        Self::start_with_prometheus(toml, true)
+    }
+
+    /// Spins up a server without configuring a Prometheus listen address.
+    #[cfg(feature = "prometheus-metrics")]
+    pub fn start_without_prometheus(toml: &str) -> Self {
+        Self::start_with_prometheus(toml, false)
+    }
+
+    fn start_with_prometheus(toml: &str, enable_prometheus: bool) -> Self {
         let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "..".to_owned());
         println!("using server src path: {server_path}");
+
+        let zone_directory = PathBuf::from(&server_path).join("tests/test-data/test_configs");
+        let original_config_path = zone_directory.join(toml);
+        let config_path =
+            temporary_server_config(&original_config_path, &zone_directory, enable_prometheus);
+        let temporary_config = TemporaryConfig(config_path.clone());
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_hickory-dns"));
         command
@@ -110,21 +220,7 @@ impl TestServer {
             "hickory_dns=debug,hickory_client=debug,hickory_proto=debug,hickory_resolver=debug,hickory_server=debug",
         )
         .arg("-d")
-        .arg(format!(
-            "--config={server_path}/tests/test-data/test_configs/{toml}"
-        ))
-        .arg(format!(
-            "--zonedir={server_path}/tests/test-data/test_configs"
-        ))
-        .arg(format!("--port={}", 0));
-        #[cfg(feature = "__tls")]
-        command.arg(format!("--tls-port={}", 0));
-        #[cfg(feature = "__https")]
-        command.arg(format!("--https-port={}", 0));
-        #[cfg(feature = "__quic")]
-        command.arg(format!("--quic-port={}", 0));
-        #[cfg(feature = "prometheus-metrics")]
-        command.arg(format!("--prometheus-listen-address=127.0.0.1:{}", 0));
+        .arg(format!("--config={}", config_path.display()));
 
         println!("named cli options: {command:#?}");
 
@@ -189,6 +285,7 @@ impl TestServer {
             ports,
             child: named,
             stdout,
+            _temporary_config: temporary_config,
         }
     }
 }

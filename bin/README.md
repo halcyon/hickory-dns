@@ -35,7 +35,6 @@ The following DNS protocols are optionally supported:
 * DNS over TLS (DoT)
 * DNS over HTTP/2 (DoH)
 * DNS over QUIC (DoQ)
-* DNS over HTTP/3 (DoH3)
 
 In order to use these optional protocols you must enable a cargo feature
 corresponding to your desired cryptography provider:
@@ -43,7 +42,10 @@ corresponding to your desired cryptography provider:
 * DoT: `tls-aws-lc-rs` or `tls-ring`
 * DoH: `https-aws-lc-rs` or `https-ring`
 * DoQ: `quic-aws-lc-rs` or `quic-ring`
-* DoH3: `h3-aws-lc-rs` or `h3-ring`
+
+DNS over HTTP/3 (DoH3) is available in the `hickory-server` library but is not
+currently exposed by the `hickory-dns` binary or its `[[listeners]]`
+configuration.
 
 ## DNSSEC
 
@@ -103,16 +105,51 @@ cargo build --release --bin hickory-dns
 
 - Launch `hickory-dns` server with test config
 
-Note that if the `-p` parameter is not passed, the server will run on default
-DNS ports. There are separate port options for DoT and DoH servers, see
-`hickory-dns --help`
+Listener addresses, ports, and protocols are configured exclusively through
+`[[listeners]]` blocks in the TOML configuration file.
 
 ```shell
-./target/release/hickory-dns -c ./tests/test-data/test_configs/example.toml -z ./tests/test-data/test_configs/ -p 24141
+./target/release/hickory-dns -c ./tests/test-data/test_configs/example.toml
 ```
+
+To serve multiple address-and-port combinations from one process, use
+self-contained `[[listeners]]` blocks. Use `dot` for DNS over TLS, `doh` for
+DNS over HTTP/2, and `doq` for DNS over QUIC:
+
+```toml
+[[listeners]]
+address = "0.0.0.0"
+port = 53
+protocols = ["udp", "tcp"]
+
+[[listeners]]
+address = "192.0.2.10"
+port = 853
+protocols = ["dot", "doq"]
+
+[listeners.tls_cert]
+path = "sec/example.cert.pem"
+private_key = "sec/example.key.pem"
+endpoint_name = "ns.example.com"
+```
+
+At least one `[[listeners]]` block is required. Listener addresses, ports,
+certificates, HTTP endpoints, and key-log settings must be configured in those
+blocks. The zone directory, NSID, and Prometheus settings are also controlled by
+the TOML file rather than command-line overrides. See the documented
+[`example.toml`](../tests/test-data/test_configs/example.toml) for the full
+configuration interface.
+
+The `zone_directory` setting is used only for zone files and related zone data.
+Relative TLS certificate and private key paths are resolved from the directory
+containing the TOML configuration file.
+
+Omitting `nsid` disables NSID responses. Configure a literal value with
+`nsid = "dns-server-01"`, or use `nsid = { source = "hostname" }`. Prometheus is
+enabled only when `prometheus_listen_addr` is configured.
 
 - Query the just launched server with `dig`
 
 ```shell
-dig @127.0.0.1 -p 24141 www.example.com
+dig @127.0.0.1 -p 53 www.example.com
 ```

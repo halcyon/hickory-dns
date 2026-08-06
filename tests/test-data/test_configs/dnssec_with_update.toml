@@ -1,3 +1,5 @@
+listeners = [{ address = "0.0.0.0", port = 53, protocols = ["udp", "tcp"] }, { address = "::", port = 53, protocols = ["udp", "tcp"] }]
+
 ## Example configuration for supported OpenSSL DNSSEC signing options.
 
 ## Default zones, these should be present on all nameservers, except in rare

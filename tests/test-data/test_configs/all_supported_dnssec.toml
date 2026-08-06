@@ -1,3 +1,5 @@
+listeners = [{ address = "0.0.0.0", port = 53, protocols = ["udp", "tcp"] }, { address = "::", port = 53, protocols = ["udp", "tcp"] }]
+
 ## Example configuration for all supported (including ring) signing options for DNSSEC.
 
 ## Default zones, these should be present on all nameservers, except in rare
@@ -34,7 +36,7 @@ zone = "example.com"
 ## zone_type: Primary, Secondary, External
 zone_type = "Primary"
 
-## file: this is relative to the directory above
+## file: this is relative to zone_directory
 file = "example.com.zone"
 
 [[zones.keys]]
