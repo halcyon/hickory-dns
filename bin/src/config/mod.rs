@@ -11,12 +11,11 @@
 use std::env;
 #[cfg(feature = "__tls")]
 use std::ffi::OsStr;
-#[cfg(feature = "prometheus-metrics")]
-use std::net::SocketAddr;
 use std::{
+    collections::{HashMap, HashSet},
     fmt, fs, io,
     marker::PhantomData,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     slice,
     sync::Arc,
@@ -83,20 +82,26 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) listen_addrs_ipv6: Vec<Ipv6Addr>,
     /// Port on which to listen (associated to all IPs)
-    #[serde(default = "default_port")]
-    pub(crate) listen_port: u16,
+    #[serde(default)]
+    pub(crate) listen_port: Option<u16>,
     /// Secure port to listen on
     #[cfg(feature = "__tls")]
-    #[serde(default = "default_tls_port")]
-    pub(crate) tls_listen_port: u16,
+    #[serde(default)]
+    pub(crate) tls_listen_port: Option<u16>,
     /// HTTPS port to listen on
     #[cfg(feature = "__https")]
-    #[serde(default = "default_https_port")]
-    pub(crate) https_listen_port: u16,
+    #[serde(default)]
+    pub(crate) https_listen_port: Option<u16>,
     /// QUIC port to listen on
     #[cfg(feature = "__quic")]
-    #[serde(default = "default_tls_port")]
-    pub(crate) quic_listen_port: u16,
+    #[serde(default)]
+    pub(crate) quic_listen_port: Option<u16>,
+    /// Explicit listener configurations
+    ///
+    /// When present, these replace the `listen_addrs_ipv4`, `listen_addrs_ipv6` and
+    /// `*_listen_port` settings.
+    #[serde(default)]
+    pub(crate) listeners: Vec<ListenConfig>,
     /// Prometheus listen address
     #[cfg(feature = "prometheus-metrics")]
     pub(crate) prometheus_listen_addr: Option<SocketAddr>,
@@ -191,6 +196,105 @@ pub(crate) struct Config {
     /// UDP receive buffer size.
     #[serde(default = "default_udp_receive_buffer_size")]
     pub(crate) udp_receive_buffer_size: u16,
+}
+
+/// DNS service protocol exposed by a configured listener.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ListenerProtocol {
+    /// plaintext DNS over UDP
+    Udp,
+    /// plaintext DNS over TCP
+    Tcp,
+    /// DNS over TLS
+    Tls,
+    /// DNS over HTTPS
+    Https,
+    /// DNS over QUIC
+    Quic,
+}
+
+impl fmt::Display for ListenerProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::Tls => "tls",
+            Self::Https => "https",
+            Self::Quic => "quic",
+        };
+        formatter.write_str(value)
+    }
+}
+
+impl ListenerProtocol {
+    /// Whether the protocol is carried over a TCP stream listener, as opposed to a UDP socket.
+    fn is_tcp_family(self) -> bool {
+        matches!(self, Self::Tcp | Self::Tls | Self::Https)
+    }
+
+    /// Whether the protocol requires TLS certificates.
+    #[cfg_attr(
+        not(any(feature = "__tls", feature = "__https", feature = "__quic")),
+        allow(dead_code)
+    )]
+    pub(crate) fn is_secure(self) -> bool {
+        matches!(self, Self::Tls | Self::Https | Self::Quic)
+    }
+
+    /// Whether this build includes support for the protocol.
+    fn is_supported(self) -> bool {
+        match self {
+            Self::Udp | Self::Tcp => true,
+            Self::Tls => cfg!(feature = "__tls"),
+            Self::Https => cfg!(feature = "__https"),
+            Self::Quic => cfg!(feature = "__quic"),
+        }
+    }
+}
+
+/// A self-contained listener with an address, a port, and the protocols to serve on it.
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListenConfig {
+    /// IP address to bind the listener to.
+    pub(crate) address: IpAddr,
+    /// Port to bind the listener to.
+    pub(crate) port: u16,
+    /// Protocols to serve on this listener; defaults to UDP and TCP.
+    #[serde(default = "default_listener_protocols")]
+    pub(crate) protocols: Vec<ListenerProtocol>,
+    /// TLS certificate for this listener's secure protocols; overrides the top-level
+    /// `tls_cert`.
+    #[cfg(feature = "__tls")]
+    #[serde(default)]
+    pub(crate) tls_cert: Option<TlsCertConfig>,
+    /// HTTP endpoint where this listener serves DNS-over-HTTPS; overrides the top-level
+    /// `http_endpoint`.
+    #[cfg(feature = "__https")]
+    #[serde(default)]
+    pub(crate) http_endpoint: Option<String>,
+    /// Whether to log TLS session keys for this listener's secure protocols; overrides the
+    /// top-level `ssl_keylog_enabled`.
+    #[cfg(feature = "__tls")]
+    #[serde(default)]
+    pub(crate) ssl_keylog_enabled: Option<bool>,
+}
+
+fn default_listener_protocols() -> Vec<ListenerProtocol> {
+    vec![ListenerProtocol::Udp, ListenerProtocol::Tcp]
+}
+
+/// Socket claims for one port, indexed by socket family (0: UDP, 1: TCP). IPv6 sockets are
+/// created with `IPV6_V6ONLY`, so `0.0.0.0` and `::` are independent wildcard scopes.
+#[derive(Default)]
+struct PortClaims {
+    /// Claims on `0.0.0.0`.
+    wildcard_v4: [Option<(usize, ListenerProtocol)>; 2],
+    /// Claims on `::`.
+    wildcard_v6: [Option<(usize, ListenerProtocol)>; 2],
+    /// Claims on specific addresses.
+    specific: HashMap<IpAddr, [Option<(usize, ListenerProtocol)>; 2]>,
 }
 
 /// Configuration options for UDP sockets.
@@ -288,6 +392,173 @@ impl Config {
     /// Read a [`Config`] from the given TOML string.
     fn from_toml(toml: &str) -> Result<Self, ConfigError> {
         Ok(toml::from_str(toml)?)
+    }
+
+    /// Validates the `[[listeners]]` entries.
+    ///
+    /// Each entry must serve at least one protocol supported by this build, must not specify a
+    /// protocol twice, and must not claim a socket that another entry already binds. A config
+    /// cannot mix `[[listeners]]` with the legacy listen settings. A listener serving a secure
+    /// protocol (`tls`, `https`, `quic`) requires a `tls_cert`, either its own or the top-level
+    /// one, and a listener may not specify `tls_cert`, `http_endpoint` or `ssl_keylog_enabled`
+    /// unless one of its protocols uses it.
+    pub(crate) fn validate_listeners(&self) -> Result<(), ConfigError> {
+        if self.listeners.is_empty() {
+            return Ok(());
+        }
+
+        let mut legacy = Vec::new();
+        if !self.listen_addrs_ipv4.is_empty() {
+            legacy.push("`listen_addrs_ipv4`");
+        }
+        if !self.listen_addrs_ipv6.is_empty() {
+            legacy.push("`listen_addrs_ipv6`");
+        }
+        if self.listen_port.is_some() {
+            legacy.push("`listen_port`");
+        }
+        #[cfg(feature = "__tls")]
+        if self.tls_listen_port.is_some() {
+            legacy.push("`tls_listen_port`");
+        }
+        #[cfg(feature = "__https")]
+        if self.https_listen_port.is_some() {
+            legacy.push("`https_listen_port`");
+        }
+        #[cfg(feature = "__quic")]
+        if self.quic_listen_port.is_some() {
+            legacy.push("`quic_listen_port`");
+        }
+        if !legacy.is_empty() {
+            return Err(ConfigError::InvalidListener(format!(
+                "`[[listeners]]` cannot be combined with {}",
+                legacy.join(", ")
+            )));
+        }
+
+        // For each port, record which listener claimed each socket, including the wildcard
+        // addresses: a wildcard claim conflicts with every claim of the same scope, socket
+        // family and port. Two protocols of one family cannot share a socket.
+        let mut bound = HashMap::<u16, PortClaims>::new();
+
+        for (index, listener) in self.listeners.iter().enumerate() {
+            let listener_number = index + 1;
+
+            if listener.protocols.is_empty() {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {listener_number} must specify at least one protocol"
+                )));
+            }
+
+            let mut protocols = HashSet::new();
+            for &protocol in &listener.protocols {
+                if !protocols.insert(protocol) {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "listener {listener_number} specifies `{protocol}` more than once"
+                    )));
+                }
+                if !protocol.is_supported() {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "listener {listener_number} protocol `{protocol}` is not available in this build"
+                    )));
+                }
+                #[cfg(feature = "__tls")]
+                if protocol.is_secure() && listener.tls_cert.is_none() && self.tls_cert.is_none() {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "listener {listener_number} protocol `{protocol}` requires a `tls_cert`"
+                    )));
+                }
+            }
+
+            #[cfg(feature = "__tls")]
+            if listener.tls_cert.is_some() && !listener.protocols.iter().any(|p| p.is_secure()) {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {listener_number} specifies `tls_cert` but lists no secure protocol"
+                )));
+            }
+            #[cfg(feature = "__https")]
+            if listener.http_endpoint.is_some()
+                && !listener.protocols.contains(&ListenerProtocol::Https)
+            {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {listener_number} specifies `http_endpoint` but does not serve `https`"
+                )));
+            }
+            #[cfg(feature = "__tls")]
+            if listener.ssl_keylog_enabled.is_some()
+                && !listener.protocols.iter().any(|p| p.is_secure())
+            {
+                return Err(ConfigError::InvalidListener(format!(
+                    "listener {listener_number} specifies `ssl_keylog_enabled` but lists no secure protocol"
+                )));
+            }
+
+            // The OS picks an ephemeral port when the socket binds, so this check cannot see
+            // conflicts on port 0.
+            if listener.port == 0 {
+                continue;
+            }
+
+            let socket_addr = SocketAddr::new(listener.address, listener.port);
+            let claims = bound.entry(listener.port).or_default();
+            for &protocol in &listener.protocols {
+                let family = usize::from(protocol.is_tcp_family());
+                let (wildcard_address, wildcard_claims) = match listener.address {
+                    IpAddr::V4(_) => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), &mut claims.wildcard_v4),
+                    IpAddr::V6(_) => (IpAddr::V6(Ipv6Addr::UNSPECIFIED), &mut claims.wildcard_v6),
+                };
+
+                // A wildcard claim conflicts with every earlier claim of the same scope,
+                // family and port; a specific claim conflicts with the wildcard of its scope
+                // and with the same specific address.
+                let conflicting = if listener.address.is_unspecified() {
+                    wildcard_claims[family]
+                        .map(|claim| (wildcard_address, claim))
+                        .into_iter()
+                        .chain(
+                            claims
+                                .specific
+                                .iter()
+                                .filter(|(address, _)| {
+                                    address.is_ipv4() == wildcard_address.is_ipv4()
+                                })
+                                .filter_map(|(address, slots)| {
+                                    slots[family].map(|claim| (*address, claim))
+                                }),
+                        )
+                        .next()
+                } else {
+                    wildcard_claims[family]
+                        .map(|claim| (wildcard_address, claim))
+                        .into_iter()
+                        .chain(
+                            claims
+                                .specific
+                                .get(&listener.address)
+                                .and_then(|slots| slots[family])
+                                .map(|claim| (listener.address, claim)),
+                        )
+                        .next()
+                };
+
+                if let Some((previous_address, (previous, previous_protocol))) = conflicting {
+                    return Err(ConfigError::InvalidListener(format!(
+                        "listener {listener_number} cannot bind `{protocol}` to {socket_addr}: listener {} already binds `{previous_protocol}` to {}",
+                        previous + 1,
+                        SocketAddr::new(previous_address, listener.port),
+                    )));
+                }
+
+                if listener.address.is_unspecified() {
+                    wildcard_claims[family] = Some((index, protocol));
+                } else {
+                    claims.specific.entry(listener.address).or_default()[family] =
+                        Some((index, protocol));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -811,6 +1082,10 @@ pub(crate) enum ConfigError {
     #[error("toml decode error: {0}")]
     TomlDecode(#[from] toml::de::Error),
 
+    /// Listener configuration is semantically invalid
+    #[error("invalid listener configuration: {0}")]
+    InvalidListener(String),
+
     /// An error occurred while parsing a zone file
     #[error("failed to parse the zone file: {0}")]
     ZoneParse(#[from] ParseError),
@@ -859,20 +1134,6 @@ fn default_directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
     path.push("System32\\Dns");
     path
-}
-
-fn default_port() -> u16 {
-    53
-}
-
-#[cfg(any(feature = "__tls", feature = "__quic"))]
-fn default_tls_port() -> u16 {
-    853
-}
-
-#[cfg(feature = "__https")]
-fn default_https_port() -> u16 {
-    443
 }
 
 fn default_udp_receive_buffer_size() -> u16 {
