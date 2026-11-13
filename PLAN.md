@@ -4,7 +4,7 @@
 
   Add self-contained [[listeners]] blocks so one Hickory DNS process can bind multiple IP-and-port combinations. Each block selects the protocols
   served on that endpoint; the TLS certificate, HTTP endpoint, and key-log settings are
-  process-wide.
+  process-wide defaults that each listener may override.
 
   Legacy configurations remain fully supported. When [[listeners]] is present, it becomes the authoritative listener configuration.
 
@@ -33,10 +33,11 @@
 
   - Require address and port; protocols defaults to ["udp", "tcp"] and must be non-empty when
     given. Supported values are udp, tcp, tls, https, and quic.
-  - Require a tls_cert when any listener contains tls, https, or quic. Keep endpoint_name optional.
+  - Require a tls_cert — the listener's own or the top-level one — when any listener contains tls,
+    https, or quic. Keep endpoint_name optional.
   - Default http_endpoint to /dns-query and ssl_keylog_enabled to false. tls_cert, http_endpoint,
-    and ssl_keylog_enabled are process-wide settings applied to every secure listener;
-    per-listener secure settings are deferred.
+    and ssl_keylog_enabled are process-wide defaults applied to every secure listener; a
+    listener may override each with its own setting, which takes precedence.
   - Keep access controls, request timeout, UDP/TCP socket tuning, and protocol-disable settings global.
   - Global and CLI --disable-* switches continue to suppress matching protocols across all listeners.
 
@@ -50,8 +51,8 @@
   - Allow at most one TCP-family protocol (tcp, tls, https) and one UDP-family protocol (udp, quic) for each socket address. Apply this across blocks
     as well as within one block.
 
-  - Reject duplicate protocols, empty listener lists, missing certificates, and
-    protocols unavailable in the compiled feature set.
+  - Reject duplicate protocols, empty listener lists, missing certificates, secure settings
+    unused by any protocol on a listener, and protocols unavailable in the compiled feature set.
 
   - Surface semantic errors during --validate, before attempting socket binds.
 
@@ -79,6 +80,6 @@
 
   - “Interface” means an IP address, not an OS interface name such as eth0.
   - One endpoint may combine protocols only when they occupy different socket families.
-  - Certificate, HTTP endpoint, and key-log settings are process-wide; per-listener certificates
-    and named TLS profiles are outside this change.
+  - Certificate, HTTP endpoint, and key-log settings are process-wide defaults; a listener may
+    override each with its own setting. Named TLS profiles remain outside this change.
   - DNS-over-HTTP/3 is outside scope because the server binary does not currently expose an H3 listener.
