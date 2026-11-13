@@ -1,5 +1,12 @@
 # Detailed Plan: Self-Contained `[[listeners]]` Blocks for Hickory DNS
 
+> **Superseded during implementation:** this early draft diverges from the shipped design on
+> branch `multi-port-listeners`: protocol names are `tls`/`https`/`quic` (not `dot`/`doh`/`doq`),
+> `protocols` is a list defaulting to `["udp", "tcp"]`, `tls_cert`/`http_endpoint`/
+> `ssl_keylog_enabled` are global, `[[listeners]]` replaces rather than extends the legacy
+> settings (mixing is a startup error), disable flags filter rather than error, and CLI port
+> flags are rejected. See PLAN.md for the reconciled specification.
+
 ## Goal
 
 Allow a single Hickory DNS process to bind multiple IP-and-port combinations, each with its own protocol selection and optional per-endpoint socket settings, via `[[listeners]]` TOML blocks. Supported protocols: `udp`, `tcp`, `dot`, `doh`, `doq`.
