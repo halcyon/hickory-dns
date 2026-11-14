@@ -19,6 +19,22 @@
 ## listen_port: port on which to list, default 53
 # listen_port = 53
 
+## listeners: explicit list of sockets to bind, each with the protocols to serve on it.
+##  When present, these replace listen_addrs_ipv4, listen_addrs_ipv6 and the *_listen_port
+##  settings; combining both is an error. `protocols` defaults to ["udp", "tcp"];
+##  "tls", "https" and "quic" are also supported and require a tls_cert.
+##  Each listener may override the top-level tls_cert, http_endpoint and ssl_keylog_enabled
+##  settings; a listener setting applies where present, the top-level setting otherwise.
+# [[listeners]]
+# address = "10.0.1.1"
+# port = 53
+# protocols = ["udp", "tcp"]
+#
+# [[listeners]]
+# address = "10.0.1.1"
+# port = 1053
+# protocols = ["udp", "tcp"]
+
 ## handshake_timeout: Timeout for performing TLS or QUIC handshakes, in seconds.
 ## Specifying a value of 0 will disable the timeout.
 # handshake_timeout = 5

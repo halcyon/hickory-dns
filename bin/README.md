@@ -115,3 +115,40 @@ DNS ports. There are separate port options for DoT and DoH servers, see
 ```shell
 dig @127.0.0.1 -p 24141 www.example.com
 ```
+
+## Listeners
+
+By default the server binds every address in `listen_addrs_ipv4`/`listen_addrs_ipv6`
+(or all unspecified addresses) to a single port. To bind more than one port, or to
+choose the protocols served per address and port, define one or more `[[listeners]]`
+sections in the configuration file:
+
+```toml
+[[listeners]]
+address = "10.0.1.1"
+port = 53
+protocols = ["udp", "tcp"]
+
+[[listeners]]
+address = "10.0.1.1"
+port = 1053
+protocols = ["udp", "tcp"]
+```
+
+When `[[listeners]]` sections are present they replace the `listen_addrs_ipv4`,
+`listen_addrs_ipv6` and `*_listen_port` settings; combining both is an error, and
+startup fails naming every conflicting setting that must be removed.
+`protocols` defaults to `["udp", "tcp"]`; `tls`, `https` and `quic` are also
+supported. A listener may override the process-wide `tls_cert`, `http_endpoint`
+and `ssl_keylog_enabled` settings: a listener setting applies where present, and
+the top-level setting otherwise. A listener `tls_cert` replaces the top-level
+`tls_cert` entirely: the `endpoint_name` in it is used as-is, without falling
+back to the top-level `endpoint_name`. Secure protocols require a certificate from the
+listener or the top-level `tls_cert`. The `-p`, `--tls-port`,
+`--https-port` and `--quic-port` command line options are rejected when
+`[[listeners]]` is configured; set ports in the listener entries. `--disable-tcp`, `--disable-udp`,
+`--disable-tls`, `--disable-https` and `--disable-quic` remove the matching
+protocols from every listener. Startup fails if two entries claim the same
+socket, if a listener lists `tls`, `https` or `quic` without a `tls_cert`, if a
+listener specifies `tls_cert`, `http_endpoint` or `ssl_keylog_enabled` that no
+protocol on it uses, or if the build lacks a listed protocol.
