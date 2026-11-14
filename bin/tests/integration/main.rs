@@ -2,6 +2,7 @@
 mod zone_handler_battery;
 mod forwarder;
 mod in_memory;
+mod multi_port_tests;
 mod named_https_tests;
 #[cfg(feature = "prometheus-metrics")]
 mod named_metrics_tests;

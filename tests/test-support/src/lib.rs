@@ -679,6 +679,17 @@ impl TestCertificates {
         Self { ca, leaf, key }
     }
 
+    /// Generates an additional server certificate for `name`, signed by the same root
+    /// certificate authority.
+    pub fn additional_leaf(&self, name: &str) -> (Certificate, KeyPair) {
+        let mut params = CertificateParams::new([name.to_string()]).unwrap();
+        params.is_ca = IsCa::NoCa;
+        params.extended_key_usages = Vec::from([ExtendedKeyUsagePurpose::ServerAuth]);
+        let key = KeyPair::generate().unwrap();
+        let leaf = params.signed_by(&key, &self.ca).unwrap();
+        (leaf, key)
+    }
+
     /// Returns the certificate chain and the server's private key.
     pub fn certified_key(&self) -> CertifiedKey {
         let cert_chain = Vec::from([self.leaf.der().to_owned(), self.ca.der().to_owned()]);

@@ -1,0 +1,17 @@
+## Two listeners on one address, each serving UDP and TCP on its own port.
+## Both entries use `port = 0`, so each socket binds an ephemeral port; CLI
+## port flags are rejected when `[[listeners]]` is configured.
+
+[[listeners]]
+address = "127.0.0.1"
+port = 0
+protocols = ["udp", "tcp"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 0
+protocols = ["udp", "tcp"]
+
+[[zones]]
+zone = "example.com"
+file = "example.com.zone"

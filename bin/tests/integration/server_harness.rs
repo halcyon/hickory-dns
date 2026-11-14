@@ -29,40 +29,35 @@ use hickory_proto::{
 use hickory_server::zone_handler::LookupOptions;
 
 #[derive(Debug, Default)]
-struct SocketPort {
-    v4: u16,
-    v6: u16,
-}
-
-#[derive(Debug, Default)]
-pub struct SocketPorts(HashMap<ServerProtocol, SocketPort>);
+pub struct SocketPorts(HashMap<ServerProtocol, Vec<SocketAddr>>);
 
 impl SocketPorts {
-    /// This will overwrite the existing value
     fn put(&mut self, protocol: impl Into<ServerProtocol>, addr: SocketAddr) {
-        let entry = self.0.entry(protocol.into()).or_default();
-
-        if addr.is_ipv4() {
-            entry.v4 = addr.port();
-        } else {
-            entry.v6 = addr.port();
-        }
+        self.0.entry(protocol.into()).or_default().push(addr);
     }
 
-    /// Assumes there is only one V4 addr for the IP based on the usage in the Server
+    /// Returns the first recorded IPv4 port for the protocol, if any.
     pub fn get_v4(&self, protocol: impl Into<ServerProtocol>) -> Option<u16> {
         self.0
             .get(&protocol.into())
-            .iter()
-            .find_map(|ports| if ports.v4 == 0 { None } else { Some(ports.v4) })
+            .and_then(|addrs| addrs.iter().find(|addr| addr.is_ipv4()))
+            .map(SocketAddr::port)
     }
 
-    /// Assumes there is only one V4 addr for the IP based on the usage in the Server
+    /// Returns the first recorded IPv6 port for the protocol, if any.
     pub fn get_v6(&self, protocol: impl Into<ServerProtocol>) -> Option<u16> {
         self.0
             .get(&protocol.into())
-            .iter()
-            .find_map(|ports| if ports.v6 == 0 { None } else { Some(ports.v6) })
+            .and_then(|addrs| addrs.iter().find(|addr| addr.is_ipv6()))
+            .map(SocketAddr::port)
+    }
+
+    /// Returns every socket address recorded for the protocol.
+    pub fn get_all(&self, protocol: impl Into<ServerProtocol>) -> &[SocketAddr] {
+        self.0
+            .get(&protocol.into())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
@@ -101,6 +96,14 @@ impl TestServer {
         let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "..".to_owned());
         println!("using server src path: {server_path}");
 
+        let config_path = format!("{server_path}/tests/test-data/test_configs/{toml}");
+        // Parse the TOML rather than scanning raw lines, so `[[listeners]]` inside a string
+        // or comment cannot fool the detection.
+        let has_listeners = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+            .is_some_and(|value| value.get("listeners").is_some());
+
         let mut command = Command::new(env!("CARGO_BIN_EXE_hickory-dns"));
         command
         .stdout(Stdio::piped())
@@ -109,20 +112,20 @@ impl TestServer {
             "hickory_dns=debug,hickory_client=debug,hickory_proto=debug,hickory_resolver=debug,hickory_server=debug",
         )
         .arg("-d")
-        .arg(format!(
-            "--config={server_path}/tests/test-data/test_configs/{toml}"
-        ))
+        .arg(format!("--config={config_path}"))
         .arg(format!(
             "--zonedir={server_path}/tests/test-data/test_configs"
         ))
-        .arg("--logging=stdout")
-        .arg(format!("--port={}", 0));
-        #[cfg(feature = "__tls")]
-        command.arg(format!("--tls-port={}", 0));
-        #[cfg(feature = "__https")]
-        command.arg(format!("--https-port={}", 0));
-        #[cfg(feature = "__quic")]
-        command.arg(format!("--quic-port={}", 0));
+        .arg("--logging=stdout");
+        if !has_listeners {
+            command.arg(format!("--port={}", 0));
+            #[cfg(feature = "__tls")]
+            command.arg(format!("--tls-port={}", 0));
+            #[cfg(feature = "__https")]
+            command.arg(format!("--https-port={}", 0));
+            #[cfg(feature = "__quic")]
+            command.arg(format!("--quic-port={}", 0));
+        }
         #[cfg(feature = "prometheus-metrics")]
         command.arg(format!("--prometheus-listen-address=127.0.0.1:{}", 0));
 
@@ -366,6 +369,8 @@ pub(crate) mod tls {
             SERVER_CERTIFICATE_DER_FILENAME,
             SERVER_CERTIFICATE_PEM_FILENAME,
             SERVER_KEY_FILENAME,
+            ALT_SERVER_CERTIFICATE_PEM_FILENAME,
+            ALT_SERVER_KEY_FILENAME,
         ] {
             if !fs::exists(tls_file_path(server_path, filename)).unwrap() {
                 return None;
@@ -401,6 +406,17 @@ pub(crate) mod tls {
             certificates.key.serialize_der(),
         )
         .unwrap();
+        let (alt_leaf, alt_key) = certificates.additional_leaf("alt.example.com");
+        fs::write(
+            tls_file_path(server_path, ALT_SERVER_CERTIFICATE_PEM_FILENAME),
+            alt_leaf.pem().as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            tls_file_path(server_path, ALT_SERVER_KEY_FILENAME),
+            alt_key.serialize_der(),
+        )
+        .unwrap();
     }
 
     fn tls_file_path(server_path: &str, filename: &str) -> String {
@@ -412,4 +428,6 @@ pub(crate) mod tls {
     const SERVER_CERTIFICATE_DER_FILENAME: &str = "example.crt";
     const SERVER_CERTIFICATE_PEM_FILENAME: &str = "example.pem";
     const SERVER_KEY_FILENAME: &str = "example.key";
+    const ALT_SERVER_CERTIFICATE_PEM_FILENAME: &str = "example-alt.pem";
+    const ALT_SERVER_KEY_FILENAME: &str = "example-alt.key";
 }
