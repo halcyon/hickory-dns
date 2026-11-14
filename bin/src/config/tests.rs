@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, read_dir};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +9,7 @@ use toml::map::Keys;
 use toml::value::Array;
 use toml::{Table, Value};
 
-use super::{Config, ServerZoneConfig};
+use super::{Config, ListenerProtocol, ServerZoneConfig};
 #[cfg(feature = "resolver")]
 use super::{FileConfig, ServerStoreConfig, ZoneTypeConfig};
 
@@ -26,7 +26,7 @@ fn test_read_config() {
     println!("reading config");
     let config = Config::read_config(&path).unwrap();
 
-    assert_eq!(config.listen_port, 53);
+    assert_eq!(config.listen_port, None);
     assert_eq!(config.listen_addrs_ipv4, Vec::<Ipv4Addr>::new());
     assert_eq!(config.listen_addrs_ipv6, Vec::<Ipv6Addr>::new());
     assert_eq!(config.handshake_timeout, Some(Duration::from_secs(5)));
@@ -77,7 +77,7 @@ fn test_read_config() {
 #[test]
 fn test_parse_toml() {
     let config = Config::from_toml("listen_port = 2053").unwrap();
-    assert_eq!(config.listen_port, 2053);
+    assert_eq!(config.listen_port, Some(2053));
 
     let config = Config::from_toml("listen_addrs_ipv4 = [\"0.0.0.0\"]").unwrap();
     assert_eq!(config.listen_addrs_ipv4, vec![Ipv4Addr::UNSPECIFIED]);
@@ -115,6 +115,437 @@ fn test_parse_toml() {
 
     let config = Config::from_toml("directory = \"/dev/null\"").unwrap();
     assert_eq!(config.directory, Path::new("/dev/null"));
+}
+
+#[test]
+fn test_parse_listeners() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "10.0.1.1"
+port = 53
+protocols = ["udp", "tcp"]
+
+[[listeners]]
+address = "10.0.1.1"
+port = 1053
+protocols = ["udp", "tcp"]
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(config.listeners.len(), 2);
+    assert_eq!(config.listeners[0].address, IpAddr::from([10, 0, 1, 1]));
+    assert_eq!(config.listeners[0].port, 53);
+    assert_eq!(
+        config.listeners[0].protocols,
+        [ListenerProtocol::Udp, ListenerProtocol::Tcp]
+    );
+    assert_eq!(config.listeners[1].port, 1053);
+    config.validate_listeners().unwrap();
+
+    // `protocols` defaults to UDP and TCP
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "::1"
+port = 53
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.listeners[0].address,
+        IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])
+    );
+    assert_eq!(
+        config.listeners[0].protocols,
+        [ListenerProtocol::Udp, ListenerProtocol::Tcp]
+    );
+    config.validate_listeners().unwrap();
+
+    // secure protocol names parse
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "0.0.0.0"
+port = 853
+protocols = ["tls", "quic"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.listeners[0].protocols,
+        [ListenerProtocol::Tls, ListenerProtocol::Quic]
+    );
+}
+
+#[test]
+fn test_reject_invalid_listeners() {
+    // serde rejects unknown fields
+    Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+foo = true
+"#,
+    )
+    .unwrap_err();
+
+    // serde rejects unknown protocols
+    Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["bogus"]
+"#,
+    )
+    .unwrap_err();
+
+    // validation rejects an empty protocol list
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = []
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    // validation rejects duplicate protocols
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp", "udp"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    // protocols using the same socket family cannot share an address and port
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp", "quic"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["tls"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["https"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    // validation rejects the same protocol on one socket twice
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    // wildcard binds conflict with specific binds of the same scope, port and family
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "0.0.0.0"
+port = 53
+protocols = ["tcp"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["tcp"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp"]
+
+[[listeners]]
+address = "0.0.0.0"
+port = 53
+protocols = ["udp"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "0.0.0.0"
+port = 53
+protocols = ["udp"]
+
+[[listeners]]
+address = "0.0.0.0"
+port = 53
+protocols = ["udp"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    // IPv4 and IPv6 wildcards are independent scopes
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "0.0.0.0"
+port = 53
+
+[[listeners]]
+address = "::"
+port = 53
+"#,
+    )
+    .unwrap();
+    config.validate_listeners().unwrap();
+
+    // UDP and TCP are different socket families and may share a port
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "0.0.0.0"
+port = 53
+protocols = ["udp"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["tcp"]
+"#,
+    )
+    .unwrap();
+    config.validate_listeners().unwrap();
+
+    // `[[listeners]]` cannot be combined with the legacy listen settings
+    let config = Config::from_toml(
+        r#"
+listen_addrs_ipv4 = ["0.0.0.0"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    let config = Config::from_toml(
+        r#"
+listen_port = 53
+
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+}
+
+// validation rejects a protocol the build does not support
+#[cfg(not(feature = "__quic"))]
+#[test]
+fn test_reject_unsupported_listener_protocol() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["quic"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+}
+
+// secure protocols require a `tls_cert`
+#[cfg(feature = "__tls")]
+#[test]
+fn test_listener_tls_cert_requirement() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["tls"]
+"#,
+    )
+    .unwrap();
+    assert!(config.validate_listeners().is_err());
+
+    let config = Config::from_toml(
+        r#"
+tls_cert = { path = "path/to/some.pem", private_key = "path/to/some.key" }
+
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["tls"]
+"#,
+    )
+    .unwrap();
+    config.validate_listeners().unwrap();
+}
+
+// a listener `tls_cert` satisfies the requirement and overrides the top-level one
+#[cfg(feature = "__tls")]
+#[test]
+fn test_listener_tls_cert_override() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["tls"]
+tls_cert = { path = "path/to/some.pem", private_key = "path/to/some.key" }
+"#,
+    )
+    .unwrap();
+    config.validate_listeners().unwrap();
+
+    let config = Config::from_toml(
+        r#"
+tls_cert = { path = "path/to/global.pem", private_key = "path/to/global.key" }
+
+[[listeners]]
+address = "127.0.0.1"
+port = 853
+protocols = ["tls"]
+tls_cert = { path = "path/to/listener.pem", private_key = "path/to/listener.key" }
+"#,
+    )
+    .unwrap();
+    config.validate_listeners().unwrap();
+    assert_eq!(
+        config.listeners[0].tls_cert.as_ref().unwrap().path,
+        PathBuf::from("path/to/listener.pem")
+    );
+}
+
+// `tls_cert` on a listener with no secure protocol is rejected
+#[cfg(feature = "__tls")]
+#[test]
+fn test_reject_listener_tls_cert_without_secure_protocol() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp"]
+tls_cert = { path = "path/to/some.pem", private_key = "path/to/some.key" }
+"#,
+    )
+    .unwrap();
+    assert!(
+        config
+            .validate_listeners()
+            .unwrap_err()
+            .to_string()
+            .contains("specifies `tls_cert` but lists no secure protocol")
+    );
+}
+
+// `http_endpoint` on a listener that does not serve `https` is rejected
+#[cfg(feature = "__https")]
+#[test]
+fn test_reject_listener_http_endpoint_without_https() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp"]
+http_endpoint = "/dns-query"
+"#,
+    )
+    .unwrap();
+    assert!(
+        config
+            .validate_listeners()
+            .unwrap_err()
+            .to_string()
+            .contains("specifies `http_endpoint` but does not serve `https`")
+    );
+}
+
+// `ssl_keylog_enabled` on a listener with no secure protocol is rejected
+#[cfg(feature = "__tls")]
+#[test]
+fn test_reject_listener_ssl_keylog_without_secure_protocol() {
+    let config = Config::from_toml(
+        r#"
+[[listeners]]
+address = "127.0.0.1"
+port = 53
+protocols = ["udp"]
+ssl_keylog_enabled = true
+"#,
+    )
+    .unwrap();
+    assert!(
+        config
+            .validate_listeners()
+            .unwrap_err()
+            .to_string()
+            .contains("specifies `ssl_keylog_enabled` but lists no secure protocol")
+    );
+}
+
+// per-listener `http_endpoint` and `ssl_keylog_enabled` parse and validate
+#[cfg(feature = "__https")]
+#[test]
+fn test_parse_listener_secure_settings() {
+    let config = Config::from_toml(
+        r#"
+tls_cert = { path = "path/to/some.pem", private_key = "path/to/some.key" }
+
+[[listeners]]
+address = "127.0.0.1"
+port = 443
+protocols = ["https"]
+http_endpoint = "/dns"
+ssl_keylog_enabled = true
+"#,
+    )
+    .unwrap();
+    config.validate_listeners().unwrap();
+    assert_eq!(config.listeners[0].http_endpoint.as_deref(), Some("/dns"));
+    assert_eq!(config.listeners[0].ssl_keylog_enabled, Some(true));
 }
 
 #[cfg(feature = "__dnssec")]
@@ -185,7 +616,7 @@ fn test_parse_tls() {
     // defaults
     let config = Config::from_toml("").unwrap();
 
-    assert_eq!(config.tls_listen_port, 853);
+    assert_eq!(config.tls_listen_port, None);
     assert_eq!(config.tls_cert, None);
 
     let config = Config::from_toml(
@@ -195,7 +626,7 @@ tls_listen_port = 8853
     )
     .unwrap();
 
-    assert_eq!(config.tls_listen_port, 8853);
+    assert_eq!(config.tls_listen_port, Some(8853));
     assert_eq!(
         config.tls_cert.unwrap().path,
         Path::new("path/to/some.pkcs12")

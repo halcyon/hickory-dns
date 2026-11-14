@@ -207,6 +207,10 @@ impl DnsServer {
         let config = Config::read_config(config_path)
             .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
 
+        config
+            .validate_listeners()
+            .map_err(|err| format!("failed to validate listeners in {config_path:?}: {err}"))?;
+
         #[cfg(feature = "prometheus-metrics")]
         let disable_prometheus = disable_prometheus | config.disable_prometheus;
         let disable_udp = disable_udp | config.disable_udp;
@@ -275,6 +279,7 @@ impl DnsServer {
             https_listen_port,
             #[cfg(feature = "__quic")]
             quic_listen_port,
+            listeners: _,
             #[cfg(feature = "prometheus-metrics")]
                 prometheus_listen_addr: _,
             disable_tcp: _,
@@ -397,7 +402,7 @@ impl DnsServer {
             tcp_socket_config,
         };
 
-        let listen_port = port.unwrap_or(listen_port);
+        let listen_port = port.or(listen_port).unwrap_or(53);
         match disable_udp {
             true => info!("UDP protocol is disabled"),
             false => setup.udp(listen_port, udp_receive_buffer_size)?,
@@ -417,14 +422,14 @@ impl DnsServer {
         #[cfg(feature = "__tls")]
         match disable_tls {
             true => info!("TLS protocol is disabled"),
-            false => setup.tls(tls_port.unwrap_or(tls_listen_port))?,
+            false => setup.tls(tls_port.or(tls_listen_port).unwrap_or(853))?,
         }
 
         #[cfg(feature = "__https")]
         match disable_https {
             true => info!("HTTPS protocol is disabled"),
             false => setup.https(
-                https_port.unwrap_or(https_listen_port),
+                https_port.or(https_listen_port).unwrap_or(443),
                 &http_endpoint,
                 tls_cert
                     .as_ref()
@@ -435,7 +440,7 @@ impl DnsServer {
         #[cfg(feature = "__quic")]
         match disable_quic {
             true => info!("QUIC protocol is disabled"),
-            false => setup.quic(quic_port.unwrap_or(quic_listen_port))?,
+            false => setup.quic(quic_port.or(quic_listen_port).unwrap_or(853))?,
         }
 
         // Drop privileges on Unix systems if running as root.
