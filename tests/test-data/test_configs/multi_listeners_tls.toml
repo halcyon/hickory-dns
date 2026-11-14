@@ -1,0 +1,16 @@
+## One listener serving DNS-over-TLS on its own port. Test runs bind an ephemeral port:
+## the harness omits CLI port flags for listener configurations.
+
+[tls_cert]
+path = "tls/example.pem"
+private_key = "tls/example.key"
+endpoint_name = "ns.example.com"
+
+[[listeners]]
+address = "127.0.0.1"
+port = 0
+protocols = ["tls"]
+
+[[zones]]
+zone = "example.com"
+file = "example.com.zone"

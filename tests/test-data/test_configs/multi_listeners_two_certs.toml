@@ -1,0 +1,23 @@
+## Two TLS listeners on one address, each serving its own certificate: the first falls back
+## to the top-level `tls_cert`, the second overrides it with a different certificate and
+## endpoint name. Test runs bind ephemeral ports.
+
+[tls_cert]
+path = "tls/example.pem"
+private_key = "tls/example.key"
+endpoint_name = "ns.example.com"
+
+[[listeners]]
+address = "127.0.0.1"
+port = 0
+protocols = ["tls"]
+
+[[listeners]]
+address = "127.0.0.1"
+port = 0
+protocols = ["tls"]
+tls_cert = { path = "tls/example-alt.pem", private_key = "tls/example-alt.key", endpoint_name = "alt.example.com" }
+
+[[zones]]
+zone = "example.com"
+file = "example.com.zone"

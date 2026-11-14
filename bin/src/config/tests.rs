@@ -669,6 +669,17 @@ define_test_config!(example);
 define_test_config!(ipv4_and_ipv6);
 define_test_config!(ipv4_only);
 define_test_config!(ipv6_only);
+define_test_config!(multi_listeners);
+#[cfg(feature = "__https")]
+define_test_config!(multi_listeners_https);
+#[cfg(feature = "__https")]
+define_test_config!(multi_listeners_https_endpoint);
+#[cfg(feature = "__quic")]
+define_test_config!(multi_listeners_quic);
+#[cfg(feature = "__tls")]
+define_test_config!(multi_listeners_two_certs);
+#[cfg(feature = "__tls")]
+define_test_config!(multi_listeners_tls);
 #[cfg(feature = "resolver")]
 define_test_config!(example_forwarder);
 
@@ -835,6 +846,23 @@ fn test_reject_unknown_fields() {
         #[cfg(not(feature = "__tls"))]
         if config_table.contains_key("tls_cert") {
             println!("skipping due to tls_cert setting");
+            skip = true;
+        }
+
+        #[cfg(not(feature = "__https"))]
+        if config_table.contains_key("http_endpoint")
+            || config_table
+                .get("listeners")
+                .and_then(Value::as_array)
+                .is_some_and(|listeners| {
+                    listeners.iter().any(|listener| {
+                        listener
+                            .as_table()
+                            .is_some_and(|table| table.contains_key("http_endpoint"))
+                    })
+                })
+        {
+            println!("skipping due to http_endpoint setting");
             skip = true;
         }
 

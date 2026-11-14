@@ -1,0 +1,20 @@
+## One HTTPS listener overriding the top-level `http_endpoint` with its own path.
+## Test runs bind an ephemeral port: the harness omits CLI port flags for listener
+## configurations.
+
+http_endpoint = "/dns-query"
+
+[tls_cert]
+path = "tls/example.pem"
+private_key = "tls/example.key"
+endpoint_name = "ns.example.com"
+
+[[listeners]]
+address = "127.0.0.1"
+port = 0
+protocols = ["https"]
+http_endpoint = "/dns-test"
+
+[[zones]]
+zone = "example.com"
+file = "example.com.zone"
